@@ -1,0 +1,63 @@
+@startuml tui-input-to-response
+' OpenCode TUI 输入到响应（v2.0.30，2026-10-19 行号实测）
+' 配套走读：5_timeline/6_tui-cli-prompt-chain.md §1-§4
+' 注：旧版 promptAsync 端点已删除；active 期间提交改为直发 durable 准入
+
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 11
+
+title TUI（mini）：footer 回车到 idle fence
+
+actor "用户" as user
+participant "footer.prompt" as footer
+participant "runPromptQueue\nruntime.queue.ts:46" as queue
+participant "stream-v2.transport\nadmitPromptTurn / runPromptTurn" as transport
+participant "SDK" as sdk
+participant "Server\n(Session.prompt)" as server
+
+user -> footer : 输入 + 回车
+footer -> queue : onPrompt(prompt)
+activate queue
+
+alt active 普通 turn 进行中
+  queue -> queue : 铸 messageID + delivery="queue"
+  queue -> transport : input.admit（串入 admissions 链）
+  activate transport
+  transport -> sdk : switchAgent/switchModel（若需要）
+  transport -> sdk : client.session.prompt({id, text, files, delivery})
+  sdk -> server : POST session.prompt（durable 入队，秒回）
+  server --> sdk : admitted
+  transport -> transport : mergePending → 队列 UI
+  deactivate transport
+  note right of queue : 不进本地队列——服务端 inbox 是事实源\n（旧版"本地 queued 可编辑"已废弃）
+else 空闲
+  queue -> queue : push 本地 queue → drain()
+  queue -> transport : input.run(prompt, signal, admitted)
+  activate transport
+  transport -> transport : runPromptTurn\n（互斥检查 state.wait）
+  transport -> sdk : switchAgent / resolveSelectedModel + switchModel
+  transport -> sdk : client.session.prompt（delivery 默认 "steer"）
+  sdk -> server : POST session.prompt
+  server --> sdk : 秒回 admitted
+  transport -> transport : mergePending + admitted?.()
+  transport -> sdk : ★settleSession：session.wait（idle fence）
+  note right of transport : turn 完成判定以 session.wait 为准\n（session.ts:265 get + awaitIdle）\n事件流只是展示性元数据
+end
+
+loop SSE 事件消费（apply reducer）
+  server --> transport : inbox.delivered / text.delta / tool.* / step.*
+  transport -> transport : fragments 对账去重\n→ write(footer commits)
+  transport -> footer : 渲染（逐字/工具卡片/压缩进度）
+end
+
+transport -> transport : settleSession 收尾：\nprojectedMessages 补画 → paintIdle
+transport --> queue : turn 完成（turn.duration → footer 状态行）
+deactivate transport
+queue -> queue : admission 版本变了？\n→ settle 循环直到版本稳定 → 下一个
+deactivate queue
+
+note over footer, server
+  中断：普通 turn → session.interrupt(resume:true)\n shell turn → abort 阻塞请求（服务端自持生命周期）
+  重连：connect 循环 booting buffer + hydrate 六路并发投影
+end note
+@enduml

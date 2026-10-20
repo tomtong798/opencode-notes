@@ -1,0 +1,63 @@
+@startuml e2e-overview
+' OpenCode 端到端全流程俯瞰（v2.0.30 / dev，2026-10-19 实测行号基线）
+' 配套走读：5_timeline/1..6 各篇；细分链路见同目录其余 puml
+
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 11
+skinparam responseMessageBelowArrow true
+
+title OpenCode 端到端全流程俯瞰：双击图标 → 提问 → 流式渲染
+
+actor "用户" as user
+participant "Electron 主进程" as main
+participant "Sidecar\n(opencode serve)" as sidecar
+participant "Location 服务集\n(53 服务/目录)" as loc
+participant "Renderer\n(SolidJS)" as renderer
+participant "LLM Provider" as llm
+
+== [1] 桌面壳启动（1_desktop-boot.md）==
+
+user -> main : 双击图标
+activate main
+main -> main : 环境准备 + 窗口先行（不等后端）
+main -> sidecar : 并行探测/拉起后端（utilityProcess）
+activate sidecar
+sidecar -> sidecar : 端口绑定 → Database(WAL+迁移)\n→ 全局服务树装配
+sidecar --> main : status.ready / /api/info 200
+main -> renderer : MessagePort 交接
+activate renderer
+
+== [2] 前端数据同步（4_renderer-boot.md）==
+
+renderer -> sidecar : SSE connect（server.connected 握手）
+sidecar --> renderer : 全局 bootstrap（config/path/projects）
+renderer -> sidecar : 目录 bootstrap（12 类资源并行拉取）
+note over sidecar, loc : 首个携带目录的请求触发\nLocation 惰性编译（3_location-lazy.md）\nInstance.layer 编译 53 服务 → 永久缓存
+loc --> renderer : store 就绪 → 界面可交互
+
+== [3] 提问执行链（5_prompt-chain.md）==
+
+user -> renderer : 输入 + 回车
+renderer -> renderer : 乐观 admitLocal()（立即显示用户消息）
+renderer -> sidecar : POST session.prompt\n（客户端铸造 message id + delivery）
+sidecar -> sidecar : reconcile 幂等 → prepare（插件/附件/技能）\n→ admit（session_inbox 落行 + InboxEnqueued）
+sidecar --> renderer : HTTP 秒回 admitted（准入与执行分离）
+sidecar -> sidecar : wake（门铃合并）→ drain\n→ promote inbox → Step
+sidecar -> llm : llm.stream（一步一流式调用）
+activate llm
+llm --> sidecar : delta / tool-call 流
+sidecar -> sidecar : 工具并行 fiber\n（durable 先于副作用）
+deactivate llm
+sidecar --> renderer : SSE 事件流（text/tool/step/…）
+renderer -> renderer : store 投影 → Solid 细粒度渲染
+
+note over user, llm
+  TUI / CLI 与 Desktop 汇聚于同一服务端契约：
+  POST session.prompt（铸 id + delivery）+ SSE 事件流 + session.wait
+  细分链路见 desktop/tui/cli 三张 puml
+end note
+
+deactivate renderer
+deactivate sidecar
+deactivate main
+@enduml

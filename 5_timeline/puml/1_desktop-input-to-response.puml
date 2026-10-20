@@ -1,0 +1,57 @@
+@startuml desktop-input-to-response
+' OpenCode Desktop/Web 输入到响应（v2.0.30，2026-10-19 行号实测）
+' 配套走读：5_timeline/5_prompt-chain.md §1-§2、§6
+
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 11
+
+title Desktop/Web：回车到流式渲染（乐观更新 + 幂等准入）
+
+actor "用户" as user
+participant "composer\nsubmit.ts" as submit
+participant "data.ts\nsession.prompt" as data
+participant "Server\nhandlers/session.ts" as server
+participant "Session\nsession.ts:145" as session
+participant "Runner\nrunner/llm.ts" as runner
+
+user -> submit : 输入 + 回车
+activate submit
+submit -> submit : clonePrompt → readSubmission 校验\n（文本/图片/附件齐备 + model/agent 已选）
+submit -> submit : 会话解析\n（活跃直接用；新会话 adapter.start()）
+submit -> submit : 乐观置 running（若当前空闲）
+submit -> data : session.prompt(admission)
+activate data
+data -> data : ★乐观准入\n新 id 入 outbox + admitLocal() → 界面立即渲染
+data -> server : POST session.prompt（同会话串行 sending Map）
+activate server
+server -> session : Session.prompt（uninterruptibleMask）
+activate session
+session -> session : admission.reconcile\n（同 id 幂等：第一次准入获胜）
+session -> session : SessionPrompt.prepare\n（插件钩子 ∥ 附件物化 8并发/20MB ∥ 技能解析）
+session -> session : admission.admit\n（bus.publish InboxEnqueued + session_inbox 落行，同事务）
+session -> session : execution.wake（门铃合并；空闲则 start fiber）
+session --> server : 秒回 admitted
+deactivate session
+server --> data : 响应
+deactivate server
+data --> submit : 返回（失败且服务端从未确认 → 回滚乐观行）
+deactivate data
+deactivate submit
+
+== 异步执行（HTTP 已返回）==
+
+activate runner
+runner -> runner : drain 门检查 → advanceToStep\n→ SessionInbox.promote（InboxDelivered + 删行，同事务）
+runner -> runner : runStep：组装 transcript+tools\n→ SessionStep.attempt（llm.stream）
+runner --> user : SSE 事件流\n（text.delta 100ms 批 / tool.call / step.ended）
+
+loop 事件回程（7 跳）
+  user -> user : Bus→EventFeed(SSE帧)→连接层 10ms 批\n→本地总线→handleEvent→store.produce\n→Solid 细粒度重渲染
+end
+
+alt 发送失败
+  data -> data : 服务端从未确认 → remove 乐观行\n+ submission.restore() 恢复输入框
+end
+
+deactivate runner
+@enduml

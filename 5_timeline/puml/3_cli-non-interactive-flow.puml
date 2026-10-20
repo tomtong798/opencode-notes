@@ -1,0 +1,59 @@
+@startuml cli-non-interactive-flow
+' OpenCode CLI 非交互流程（v2.0.30，2026-10-19 行号实测）
+' 配套走读：5_timeline/6_tui-cli-prompt-chain.md §5
+
+skinparam sequenceMessageAlign center
+skinparam defaultFontSize 11
+
+title CLI（opencode run）：单发 steer + 事件循环 + 投影对账
+
+actor "用户" as user
+participant "run.ts" as cli
+participant "noninteractive.ts\n:76" as run
+participant "consume()\n事件循环" as consume
+participant "SDK" as sdk
+participant "Server" as server
+
+user -> cli : opencode run "问题" [--model] [--attach]
+activate cli
+cli -> cli : mergeInput（参数 + piped stdin）\nprepareFile（≤10MB，text→<file>块）
+cli -> cli : resolveSessionTarget\n（continue/session/fork/model/agent）
+cli -> run : runNonInteractivePrompt({...)
+
+activate run
+run -> run : 铸 messageID（幂等前提）
+run -> sdk : event.subscribe 先建流\n★先订阅后提交，防丢事件
+activate consume
+run -> sdk : switchAgent / switchModel
+run -> sdk : client.session.prompt({...delivery:"steer"})
+sdk -> server : POST session.prompt
+server --> sdk : 秒回 admitted
+
+loop 事件消费
+  server --> consume : session.inbox.delivered（promoted=true）
+  server --> consume : step.started / text.ended / tool.success\n→ stdout / json-lines
+end
+
+alt 权限询问（非 --auto）
+  server --> consume : permission.asked
+  consume -> sdk : permission.reply(reject + 反馈消息)\n（工具以普通失败落进模型可见输出，模型继续）
+end
+alt 表单/提问
+  server --> consume : form.created
+  consume -> sdk : session.form.cancel（+ 取消反馈）
+end
+
+run -> sdk : 提交后即补处理积压 blocker\n（permission.list / form.list 并行拉取）
+run -> sdk : ★session.wait（idle fence）
+run -> run : Promise.race([waiting, completed])\n（防流断后 wait 悬挂）
+run -> run : ★reconcile() 投影对账\nmessage.list 分页拉取 → 已渲染前缀比对只补 suffix\n（防重复输出；未提升 → "Prompt was not promoted"）
+consume --> run : 完成（exitCode: 130 中断 / 1 失败 / 0 成功）
+deactivate consume
+run --> cli : 返回
+deactivate run
+deactivate cli
+
+note over user, server
+  会话所有权：ownsSession 沿 parentID 链向上判归属\n子代理会话的权限/表单归本 run；共享服务器上其他会话不动
+end note
+@enduml
