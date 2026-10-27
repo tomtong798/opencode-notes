@@ -1,5 +1,7 @@
 # TypeScript
 
+
+> 零基础前置：怎么把 TS 跑起来 → [../2.5_tooling/0.1_ts-running-guide.md](../2.5_tooling/0.1_ts-running-guide.md)
 ## 是什么
 
 带静态类型的 JavaScript 超集，编译（转译）到 JS 运行。类型在编译期检查，运行时擦除。

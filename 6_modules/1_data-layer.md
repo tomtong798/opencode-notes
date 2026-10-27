@@ -5,6 +5,17 @@
 > 权威出处：`specs/v2/event-stream-architecture.md`
 > [返回 README](README.md) | 前置 [0_effect-infra.md](0_effect-infra.md) | 关联 [../5_timeline/2_server-init.md](../5_timeline/2_server-init.md)（数据库初始化时序）
 
+## 0.5 通俗完整描述（先读这段再看细节）
+
+所有"发生过的事"（谁发了消息、模型说了什么、工具返回了什么）先记成一条条**事件**落进 SQLite 的 event 表——只追加、永不修改，像会计的流水账；然后每次事件落库的**同一个事务里**，一个"投影函数"把"发生了什么"换算成"某张表该长什么样"（session、session_message 这些你能直接查的读表）。**事件是真相源，表是投影（可重建的缓存）**——这就是本篇的核心：事件溯源的存储与总线。
+
+为什么绕这一层而不是直接写表？三个直接写表的死穴：①**丢历史**——消息编辑后旧内容没了，"怎么变成这样的"无从回答；②**崩溃不一致**——写了一半的状态停在中途，事务边界保护不了跨表逻辑；③**重建无力**——内存态一丢，没有任何东西能恢复。事件+投影逐一解决：流水账永远在（审计/回放/重建都是读它）；事件和投影同事务（要么都成要么都没有，表永远不会和事件流说不一样的故事）。
+
+总线（Bus）是这套机制的交通枢纽：publish 一条事件 = 上锁（同聚合串行）→ 投影写表 → 事件落表 → 提交后才通知订阅者（SSE 推给前端就是从这出）。订阅者永远看到提交后的事实——慢消费者拖不坏数据。
+
+一句话：**先记事实（事件流水账），再算现状（投影读表）；事实永不丢、现状随时可重建——崩溃安全的全部根基**。
+---
+
 ## 0. 模块地图
 
 ```
@@ -223,6 +234,48 @@ V1→V2 一次性数据迁移：`v1-migration.bun.ts`（1135 行）用 `bun:sqli
 - **事务边界**：每条 publish/publishAll 一个 `{ behavior: "immediate" }` 事务；`Effect.uninterruptible` 包裹（:315, :576）防 fiber 取消撕开半事务；迁移每条独立事务 + 完成标记（migration.ts:111-118）。
 - **并发**：进程内 KeyedMutex 按聚合串行（bus.ts:200, :469）；跨实例靠 immediate 写锁 + `busy_timeout`；同文件多实例共享 bootstrap 信号量（database.ts:55-65）。
 - **执行层恢复**（顺带指路）：write-ahead execution claim + 启动恢复在 session/execution，非本篇范围。
+
+## 9.5 内存与磁盘的分界线（重启时各发生什么）
+
+一个横切问题的统一答案：**内存里有什么、磁盘上有什么、重启后各发生什么？**
+
+### 对照表
+
+| 层 | 存在哪 | 生命周期 | 重启后 |
+|---|---|---|---|
+| 全局服务树（Database 连接/Bus/Job/SessionExecution…） | 内存 | 随进程 | 重建（便宜——对象与连接） |
+| Location 图（每目录 53 服务：agent/skill/MCP/工具…） | 内存（LayerMap 缓存） | 随进程；进程退出 = owner scope 关闭、finalizer 依次 shutdown（location-services.ts:18 侧） | **首个带该目录的请求重新懒编译**（重新读配置、发现技能、连 MCP——重启后第一下又慢的根源） |
+| 读模型投影（session_v2/session_message 等表的服务端镜像） | 内存 + 磁盘双份 | 表在磁盘；服务实例内的派生状态在内存 | 表直接可读；运行时状态从投影派生 |
+| 运行中的 runner/工具 fiber | 内存 | 随进程消失 | 由恢复子系统接手（下节） |
+| **event / event_sequence（真相源）** | **磁盘 SQLite** | 永久 | 一切恢复的起点 |
+| session_inbox（未消费的工作） | 磁盘 | 永久 | 重新 wake 即继续执行 |
+
+关键认知：**服务图不是"被持久化的东西"，是从磁盘派生物（配置文件/AGENTS.md/SKILL.md…）构建的缓存——重建是设计内的正常路径，不是故障恢复**。
+
+### 重启后的两轨恢复
+
+```
+重启 opencode serve
+│
+├─ 便宜轨（派生重建，不是"恢复"）：
+│    全局服务树 + 打开过的目录逐一重新懒编译
+│    （读磁盘派生物重建——无需任何恢复协议）
+│
+└─ 精确恢复轨（durable 事件/标记驱动）：
+     write-ahead claim 留下的"执行到一半"标记
+       → resumeSuspendedSessions 续跑（10 次重试上限）
+     settleStaleCompactions / settleStaleToolCalls
+       （上进程遗留的 running 投影判为失败）
+     session_inbox 残留行 → 重新 wake 继续
+     持久终端甚至经外部 daemon 找回（persistent-pty）
+     详见 [4_session.md](4_session.md) §10 / [5_inbox-coordination.md](5_inbox-coordination.md) §6
+```
+
+### 为什么内存可以随便丢
+
+"durable 先于副作用"不变量保证**磁盘上的事实记录永远领先于任何内存状态**：每个事实先落 event 表（同事务投影）再产生副作用，内存里未及提交的最多丢掉"尚未发生过的事实"。所以服务图、投影镜像、运行 fiber 全部允许随进程消失——重启后便宜轨重建 + 精确轨续跑，用户态无缝衔接。
+
+> 一句话：**内存 = 派生缓存，磁盘 = 事实记录；内存尽可以丢，丢的都能重建或续跑。**
 
 ## 演进注记
 

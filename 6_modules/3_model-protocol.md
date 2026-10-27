@@ -56,6 +56,37 @@ core 侧另有接缝文件：`session/model-request.ts`（439 行，组装 `LLMR
 
 providers/ 目录的 66 个文件是"部署皮肤"的典型样例——每个平均不足百行，只声明五轴并按需覆盖，例如 `providers/deepseek.ts` 全文要点：`protocol: OpenAIChat.protocol` + `Endpoint.path("/chat/completions")` + `configure()` 里 `AuthOptions.bearer(input, "DEEPSEEK_API_KEY")`；`anthropic-compatible.ts`、`openrouter.ts` 等则各自组合多路由。协议本体（protocols/）与部署（providers/）的分界是本层最重要的代码组织决策。
 
+## 0.5 通俗完整描述（先读这段再看细节）
+
+<!-- https://models.dev/ -->
+<!-- https://models.dev/api.json -->
+
+用户选一个模型（如 `anthropic/claude-sonnet-4-5`）之后，这条"出站管线"开始工作。它要回答的问题只有一个：**怎么把一次统一的 LLM 请求送到 ~50 家长相各异的供应商那里，再把流式响应原样吐回来**。
+
+**第一步：知道有哪些模型（目录）**。opencode 不在代码里硬编码模型清单——启动时从外部源 `models.opencode.ai/api.json` 拉取目录数据（离线兜底一份内置 snapshot，再往 KV 缓存里存），归一化成 `Snapshot`（每家 provider 的信息 + 模型列表 + limits）。core 侧的 Provider/Model 服务把目录按"有凭据、没被策略禁"过滤成可用清单——这就是 UI 模型选择器的数据来源。
+
+**第二步：把目录条目变成可执行对象（解析）**。`ModelResolver.resolve(ref)` 做"查目录 → 叠加 variant（thinking 档位等 overlay）→ 取凭据 → **按目录数据指定的包加载 provider 文件**"。关键设计：协议选择既不硬编码也不靠用户配——目录数据里每个模型的 `package` 字段指向 `@opencode/ai/providers/<x>`，那个文件的 `Route.make` 组合决定一切。产出 `LanguageModel{provider, route, defaults}`——**从这一步起，"模型"不再是一条数据，而是一个绑定了完整路线（协议+端点+鉴权+传输）的可执行对象**。
+
+**第三步：组装统一请求**。Session 侧（Step 执行时）把 system prompt + 对话历史 + 工具定义 + agent 设置组装成统一的 `LLMRequest`——**这是内部标准格式，与任何供应商无关**。工具 schema 统一转成标准 JSON Schema，缓存策略/推理力度等也在这一步应用。
+
+**第四步：协议降级（ai 包的核心工作）**。`route.body.from(LLMRequest)` 把统一请求翻译成供应商原生格式——anthropic 的 messages、openai 的 chat、gemini 的 contents 各不相同，工具调用的表达方式也不同（四套协议适配器就是干这个的）。同一套 SSE 字节流回来，再被各自的事件归一化器统一成内部 `LLMEvent` 流（text-delta/tool-call/finish…）——**进来的路和出去的路对称：统一→方言，方言→统一**。
+
+两个容易理解偏差的关键点：
+
+1. **"模型目录"是数据不是代码**——加一家新供应商默认只是目录数据的事（改 models.dev），只有新协议形态才需要写代码。目录带版本兜底（snapshot + KV 缓存 + 5 分钟去抖刷新），断网也能用旧目录。
+2. **协议 ≠ 供应商**——协议是"API 长什么样"（四种：anthropic-messages/openai-chat/open-responses/gemini），供应商是"部署在哪"（endpoint/auth/transport 部署四轴）。~50 家供应商靠"协议复用 + 各自 Route 组合"覆盖，而不是 50 套适配器。deepseek 走 openai-chat 协议、azure 是 anthropic 协议换端点换鉴权——同一协议代码服务多家。
+
+理解这个分层的一个好框架：**这层本质是双向 Adapter 模式**（统一 ↔ 方言的转换），但有两个容易低估的地方：
+
+- **适配的不只是"格式"，是"格式 + 语义"**。纯字段改名只是一半工作量，难的是语义对齐：工具调用四家四种表达（anthropic 的 tool_use 块 / openai 的 tool_calls / responses 的 function_call item / gemini 的 functionCall）、思维链字段形态各异（含 thought signature 回传）、流式分帧差异（openai 系 `[DONE]` 哨兵 vs anthropic 事件类型 vs 不完整帧拼接）——每个协议内部各有一个**事件状态机**，把各家 SSE 的语义结构（而非仅字节）归一成统一 LLMEvent 流。
+- **Adapter（Protocol）之上还有一层"配置工厂"（Route）**。如果只有四种 adapter，~50 家供应商每家还得手写"选哪种 adapter + 什么端点 + 怎么鉴权"——Route.make 把这个组合本身数据化（Protocol + Endpoint + Auth + Transport 四轴），目录的 `package` 字段指向各家的 Route 组合。"选哪个 adapter"不再散在代码里，才有"加供应商默认只改数据"的效果。
+
+失败与重试也有统一语义：provider-error.ts 把各家错误分类（限流/传输/内容策略/不完整流），`isRetryable` 供 Step 的重试协调器判定（限流退避重试、内容策略不重试）——Session 侧不需要理解各家错误码。
+
+一句话走完全程：**目录说"有什么"，解析把条目变成"绑好路线的对象"，Session 组装"统一请求"，协议层翻译成"方言"发出去、把"方言响应"翻译回流——上层只见统一的模型和统一的事件流**。
+
+---
+
 ## 1. 心智模型
 
 整条管线的分界线在 **catalog（目录）与 runtime（运行时）之间**：core 的 `Model.Info` 只是目录里的静态描述（含 variants/cost/limit），真正发请求前必须经 `ModelResolver` 变成 ai 包的 `LanguageModel`——后者绑定了完整的 `Route`（protocol+endpoint+auth+transport）。协议选择**既不按 provider 硬编码也不按用户配置**，而是目录数据（`model.package` 指向 `@opencode/ai/providers/<x>`）决定加载哪个 provider 文件，该文件的 `Route.make` 组合决定了协议。
@@ -253,6 +284,25 @@ streamPrepared（client.ts:423-501）
 `generate` 之外的第三入口 `compact`（client.ts:632-648）分 endpoint/trigger 两机制，仅 compact 能力路由可用（`canCompact` 类型守卫 236-248）；step.ts 不直接调用它，由 runner 侧 compaction 流程使用。
 
 ## 5. 协议层走读（逐协议）
+
+### 5.0 四协议背景知识（外部视角速览）
+
+> 来源：元宝"四种主流 LLM 网关协议对比"对话校验收录（2026-10-26）。以下从**协议本身**（而非仓内实现）的视角速览——四者是当前主流 LLM 网关的四套线协议契约，不是"同一模型四种叫法"。
+
+| | openai-chat | open-responses | anthropic-messages | gemini |
+|---|---|---|---|---|
+| 端点 | `POST /v1/chat/completions` | `POST /v1/responses` | `POST /v1/messages` | `POST /v1beta/models/{model}:generateContent` |
+| system 位置 | messages 里 `role:system` 一条 | `instructions` 或 system item | ★顶层 `system` 字段（不进 messages） | 顶层 `systemInstruction.parts` |
+| 内容单元 | 扁平 `content:string` | typed items（input_text/function_call/reasoning） | content blocks（text/tool_use/tool_result/thinking） | parts[]（text/functionCall/inline_data） |
+| 工具结果回传 | `role:tool` + tool_call_id | function_call_output item + call_id | user 消息嵌 tool_result block（关联 tool_use_id） | functionResponse part（按函数名） |
+| 流式事件 | SSE `choices[].delta`（[DONE] 哨兵收尾） | 结构化事件（response.created/item.*/delta） | message_start/content_block_delta/message_delta | candidate chunk 分片（结构最平） |
+| thinking 保真 | 无一等字段，易丢 | ★原生 reasoning item（最好） | thinking block + 签名（须原样回放） | thought + thoughtSignature（特殊映射） |
+
+三条与仓内实现的印证/补充：
+
+1. **"thinking 保真度"正是仓内语义对齐的难点**——anthropic 的签名回放、gemini 的 thoughtSignature 映射（§5.4），与上表"各家各有形态"一致。
+2. **选型原则："先看客户端/上游发什么，别看模型叫什么"**——这正是仓内"协议由目录 package 字段决定、与 provider 名无关"的外部成因（同一个模型多家网关四种入口都能调，转换层决定损耗在哪）。
+3. **网关通用做法印证了本仓架构**：暴露多入口 → 内部一套中间表示（IR）→ 请求侧转上游格式、响应侧转回调用方协议——opencode 的 `LLMRequest/LLMEvent` 就是那个 IR，§0.5 的"双向 Adapter"即此模式。元宝提到的"全转 Chat Completions 能跑 80% 但丢 thinking 细节"，正是 opencode 保留四套协议而不收敛为一套的理由。
 
 `Protocol` 接口（route/protocol.ts:39-53）= `body{schema, from}` + `stream{event, initial, step, terminal?, onHalt?}`。每个协议实现都是同一个形状：Schema 定义 wire 结构 → `fromRequest` 降级函数 → SSE/事件流状态机 → `Protocol.make` + `Route.make`。协议被选择的方式：**provider 部署文件组合 Route，目录数据的 package 字段决定加载哪个文件**；如 `providers/deepseek.ts:23-29` 直接 `protocol: OpenAIChat.protocol` 复用 chat 协议——DeepSeek/Together/Cerebras 等无需各抄 300 行（protocol.ts:34-36 注释）。open-responses 是"provider 中立 Responses 基线"，Bedrock Mantle 与 Vertex Responses 复用它（providers/amazon-bedrock-mantle.ts:48-50）。
 

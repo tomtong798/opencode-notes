@@ -12,7 +12,10 @@
 | [3_ops/](3_ops/README.md) | 运维排障：日志位置、部署目录 |
 | [4_desktop/](4_desktop/README.md) | 桌面端专卷：Electron 壳层（进程/通道/存储） |
 | [5_timeline/](5_timeline/README.md) | 端到端时间线专卷：图标→服务→Location→前端→提问→终端提问（代码级走读） |
-| [6_modules/](6_modules/README.md) | 模块详解卷：子系统内部结构（Effect 基建/数据层/Session/工具等 17 篇规划） |
+| [6_modules/](6_modules/README.md) | 模块详解卷：子系统内部结构（Effect 基建/数据层/Session/工具等 17 篇） |
+| [7_nonfunctional/](7_nonfunctional/README.md) | 非功能机制卷：质量怎么保证（恐惧清单×机制清单×失效×测试，10 篇规划） |
+| [history/](history/README.md) | 发展史专卷：四段式演进与各期痛点解法（git 全史 + issue 数据实证，4 篇+数据附录） |
+| [features/](features/README.md) | 自研特性卷：opencode fork 的 9 个特性文档（基线与上游卷不同） |
 | [survey/](survey/README.md) | 横向调研：跨仓库对比、行业趋势（含 AgentScope 系列 4 篇） |
 
 ## 约定

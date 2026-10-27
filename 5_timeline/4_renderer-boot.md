@@ -26,23 +26,49 @@ entry.tsx render
   （进入会话页时再拉 message/pending）
 ```
 
-## 1. 入口与 Provider 树
+## 1. 入口与 Provider 根树
 
-**`packages/app/src/entry.tsx`**
+**`packages/app/src/entry.tsx`** —— 入口加载流：
 
-| 行号 | 发生什么 |
-|---|---|
-| L3 | `import "@/runtime/polyfills"` 最先加载 |
-| L52 | `createWebPlatform(pkg.version)` 平台适配器 |
-| L77-115 | `render()`：`<PlatformProvider><AppBaseProviders><AppInterface>` 三层 |
+```
+entry.tsx
+│
+├─ L3    import "@/runtime/polyfills"（最先加载）
+│
+├─ L52   createWebPlatform(pkg.version)（平台适配器）
+│
+└─ L77-115 render() 三层
+    └ <PlatformProvider>
+        └ <AppBaseProviders>
+            └ <AppInterface>
+```
 
-**`packages/app/src/app.tsx`**
+**`packages/app/src/app.tsx`** —— Provider 嵌套流（两层装配）：
 
-| 行号 | 发生什么 |
-|---|---|
-| L24-36 | `QueryClient`：`refetchOnReconnect/WindowFocus/Mount` 全 **false**——**重取策略完全自管**（由事件驱动失效，不靠 Query 默认行为） |
-| L48-85 | `AppBaseProviders`：Meta→Font→Theme→Language→i18n→ErrorBoundary→**QueryProvider**→Dialog→ExtensionRoot→FileComponent |
-| L87-118 | `AppInterface`：**ServersProvider**（持久化的服务器连接表，registry.tsx:214-301）→Settings→Router；Root=L96：TabsProvider→**GlobalProvider**→CommandProvider |
+```
+AppBaseProviders（L48-85，基础层自外向内）
+│
+├─ Meta → Font → Theme → Language → i18n
+│
+├─ ErrorBoundary
+│
+├─ ★QueryProvider（L24-36 QueryClient）
+│   └ refetchOnReconnect/WindowFocus/Mount 全 false
+│     ——重取策略完全自管（事件驱动失效，不靠 Query 默认）
+│
+└─ Dialog → ExtensionRoot → FileComponent
+
+AppInterface（L87-118，应用层）
+│
+├─ ServersProvider（持久化的服务器连接表，registry.tsx:214-301）
+│
+├─ Settings → Router
+│
+└─ Root（L96）
+    └ TabsProvider
+        └ ★GlobalProvider        ←§2 的主角
+            └ CommandProvider
+```
 
 ## 2. 每服务器一个控制器
 
@@ -84,13 +110,44 @@ createServerController(conn, scope, projects, …)
 
 ## 3. 连接层：SSE 循环
 
-**`packages/app/src/runtime/server/client.tsx:62-122`**（`createServerSdkContextBase`）：
+**先厘清分层**——renderer 里"连接 server"由两个部件承担，client 包的两形态各司其职：
 
-| 行号 | 发生什么 |
-|---|---|
-| L77 | `createServerTransport({http, fetch})`——生成的 API 客户端 |
-| L89 | `createOpenCodeEventSource()` = `createGlobalEmitter<OpenCodeEventMap>()` 本地事件总线 |
-| L92-105 | **`createClientConnection(transport.api, {onEvent: (e) => events.publish(e), flushInterval: 16, pageLifecycle: true, …})`** |
+```
+① OpenCodeClient（client/promise 形态）          app: api.ts:26
+│    OpenCode.make({ baseUrl, headers: Basic })
+│    = 生成的类型化 HTTP 客户端。
+│    "直接连 server"发请求（POST session.prompt、
+│    GET 列表）的就是它——fetch 各自独立。
+│
+└─ ② client/solid 层（叠在 ① 之上，不与之并列）
+     ├ createClientConnection(transport.api)     ← 吃的就是 ①
+     │   api.event.subscribe() 建 SSE 流
+     │   （SharedEvents：多订阅者共享这一条连接）
+     │   + 重连/watchdog/10ms 批量 flush
+     └ createData()：SSE 事件 → Solid store 投影
+```
+
+即：**请求走 promise 客户端，事件流走 solid 层；solid 不是另一条连接，是 promise 之上的响应式层；SSE 全 renderer 只有一条**（SharedEvents 共享）。
+
+**`packages/app/src/runtime/server/client.tsx:62-122`**（`createServerSdkContextBase`）—— SDK 上下文的装配流：
+
+```
+createServerSdkContextBase
+│
+├─ L77       createServerTransport({http, fetch})
+│            ——生成的 API 客户端（promise 形态）
+│
+├─ L89       createOpenCodeEventSource()
+│            = createGlobalEmitter<OpenCodeEventMap>()
+│            ——本地事件总线
+│
+└─ L92-105   ★createClientConnection(transport.api, {
+               onEvent: (e) => events.publish(e),
+               flushInterval: 16,
+               pageLifecycle: true, … })
+               ——SSE 连接器（吃 promise 客户端，
+                 事件进本地总线）
+```
 
 **`packages/client/src/solid/connection.ts`** —— 重连状态机的运行流：
 
@@ -133,13 +190,22 @@ createServerController(conn, scope, projects, …)
 
 **`packages/app/src/runtime/server/sync.tsx:110-123`** —— bootstrap Query（`enabled: connected()`）：
 
-**`global-sync/bootstrap.ts:81-108` `bootstrapGlobal`** 三查询 `runAll` 并行：
+**`global-sync/bootstrap.ts:81-108` `bootstrapGlobal`** 三查询 `runAll` **并行**：
 
-| 查询 | 行号 | 内容 |
-|---|---|---|
-| config | L91 | `loadGlobalConfigQuery`——**当前是占位返回 `{}`**（L55 有 TODO：V2 客户端暴露 config API 后恢复） |
-| path | L92 | `loadPathQuery` → `api().location.get()` |
-| projects | L93-104 | `loadProjectsQuery` → `api().project.list()`（归一化入 store） |
+```
+bootstrapGlobal
+│
+├─ L91    loadGlobalConfigQuery
+│         ★当前是占位返回 {}（L55 有 TODO：
+│          V2 客户端暴露 config API 后恢复）
+│
+├─ L92    loadPathQuery → api().location.get()
+│
+└─ L93-104 loadProjectsQuery
+          → api().project.list()（归一化入 store）
+
+三路并行，全部 settle 后 bootstrap 完成
+```
 
 ### `server.connected` 事件处理器
 
@@ -195,18 +261,34 @@ bootstrapInstance(directory)
 
 ### handleEvent——中心投影器（L633-1341）
 
-代表性映射（与 `SessionProjector` 服务端投影**同构**，两端必须一致）：
+代表性映射（与 `SessionProjector` 服务端投影**同构**，两端必须一致）——按一次提问的事件到达顺序读：
 
-| 事件 | 行号 | 投影动作 |
-|---|---|---|
-| `server.connected` | L635 | 拉初始态（见上） |
-| `session.created` | L671 | 移出 outbox、sync info |
-| `session.inbox.enqueued` | L816 | 移出 outbox、`admitLocal()` 立即渲染 |
-| `session.inbox.delivered` | L792 | 移出 pending、消息入转录尾 |
-| `session.step.started` | L881 | 建/改 assistant 行 |
-| `session.text.delta` | L952 | `message.editText(..., t => t.text += delta)` |
-| `session.tool.called/success` | L983/996 | 工具行 running→completed |
-| `session.execution.*` | L1052-1068 | active 状态 + idle 标记 |
+```
+handleEvent（L633-1341）
+│
+├─ L635    server.connected
+│          └ 拉初始态（见上）
+│
+├─ 提交回声（乐观 UI 闭环）
+│   ├ L671    session.created
+│   │         └ 移出 outbox、sync info
+│   └ L816    session.inbox.enqueued
+│             └ 移出 outbox、admitLocal() 立即渲染
+│
+├─ L792    session.inbox.delivered
+│          └ 移出 pending、消息入转录尾
+│
+├─ 执行流
+│   ├ L881    session.step.started
+│   │         └ 建/改 assistant 行
+│   ├ L952    session.text.delta
+│   │         └ message.editText(..., t => t.text += delta)
+│   └ L983/996 session.tool.called / success
+│             └ 工具行 running → completed
+│
+└─ L1052-1068  session.execution.*
+               └ active 状态 + idle 标记
+```
 
 ### 同步协调器 createSync（L174-227）
 

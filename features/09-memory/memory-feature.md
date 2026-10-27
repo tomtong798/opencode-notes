@@ -1,0 +1,983 @@
+# OpenCode 持久化记忆系统深度分析
+
+> **代码库位置**: `packages/opencode/src/plugins/memory/` | **总代码量**: ~2700 行 TypeScript + ~570 行提示词文本  
+> **实现方式**: 内置插件 (Built-in Plugin)，通过 11 个钩子全面集成到会话生命周期
+
+---
+
+## 目录
+
+1. [架构总览](#1-架构总览)
+2. [数据模型](#2-数据模型)
+3. [核心子系统](#3-核心子系统)
+   - [3.1 Memory — FTS5 搜索引擎](#31-memory--fts5-搜索引擎)
+   - [3.2 Checkpoint — 会话状态压缩](#32-checkpoint--会话状态压缩)
+   - [3.3 Dream — 记忆整合](#33-dream--记忆整合)
+   - [3.4 Distill — 工作流发现](#34-distill--工作流发现)
+4. [上下文注入机制](#4-上下文注入机制)
+5. [会话压缩与重建](#5-会话压缩与重建)
+6. [钩子集成全景](#6-钩子集成全景)
+7. [关键架构决策](#7-关键架构决策)
+8. [配置与调优](#8-配置与调优)
+
+---
+
+## 1. 架构总览
+
+持久化记忆系统由 **四个子系统** 和 **三个 LLM 子代理** 构成，通过插件钩子系统与 OpenCode 会话引擎深度集成。
+
+### 1.1 四个子系统
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Persistent Memory System                     │
+├───────────────┬──────────────────┬───────────────┬──────────────┤
+│    Memory     │   Checkpoint     │     Dream     │   Distill    │
+│  (FTS5 搜索)   │ (会话状态压缩)     │ (记忆去重整合)  │ (工作流发现)   │
+├───────────────┼──────────────────┼───────────────┼──────────────┤
+│ • SQLite FTS5 │ • 11节结构化文档   │ • 7天间隔      │ • 30天间隔    │
+│ • BM25 排序   │ • Token阈值触发    │ • 5阶段算法     │ • 7阶段算法    │
+│ • 指纹增量索引 │ • 崩溃安全(.bak)  │ • 轨迹验证      │ • 轨迹验证     │
+│ • 延迟同步    │ • 13条校验规则    │ • 行数/大小限制  │ • 最小形式选择  │
+└───────────────┴──────────────────┴───────────────┴──────────────┘
+```
+
+### 1.2 文件职责矩阵
+
+| 文件 | 行数 | 职责 | 关键导出 |
+|------|------|------|----------|
+| `hooks.ts` | 726 | 插件入口，11个钩子、4个工具、3个子代理注册、命令注册 | `memoryHooks` |
+| `fts5.ts` | 357 | SQLite FTS5 引擎：建表/迁移/指纹索引/BM25搜索 | `initDB`, `search`, `reconcile`, `indexFile`, `closeDB` |
+| `checkpoint.ts` | 657 | Checkpoint 生命周期：模板引导/边界计算/Writer状态机/备份恢复 | `trySpawnCheckpointWriter`, `computeBoundary` |
+| `injection.ts` | 199 | 上下文构建：首次注入(2文件) + 压缩重建(4文件+索引) | `buildMemoryContext`, `buildRebuildContext` |
+| `checkpoint-validator.ts` | 253 | 写入后质量校验，13条规则 | `validateCheckpoint` |
+| `dream-distill.ts` | 200 | Dream/Distill 自动触发门控 | `tryAutoDream`, `tryAutoDistill` |
+| `memory-tool.ts` | 40 | 路径安全校验的文件读写 | `memoryWrite`, `memoryEdit` |
+| `paths.ts` | 26 | 全局路径常量 | `MEMORY_DB_PATH`, `GLOBAL_MEMORY_PATH` |
+| `state.ts` | 30 | 子会话创建封装 | `spawnChildSession` |
+| `agent.ts` | 15 | 代理角色标记（防递归） | `markSession`, `isSystemSession` |
+| `log.ts` | 54 | 结构化 JSON 日志 | `info`, `warn`, `error_` |
+
+### 1.3 提示词文件
+
+| 文件 | 行数 | 用途 |
+|------|------|------|
+| `prompt/memory-system.ts` | 50 | 每次 LLM 调用注入的系统指令块 |
+| `prompt/checkpoint-writer.txt` | 167 | Checkpoint Writer 子代理的完整工作流程 |
+| `prompt/dream.txt` | 155 | Dream 整合代理的 5 阶段算法 |
+| `prompt/distill.txt` | 199 | Distill 工作流打包代理的 7 阶段算法 |
+
+---
+
+## 2. 数据模型
+
+### 2.1 SQLite 数据库 (`memory.db`)
+
+**位置**: `~/.local/share/opencode/memory.db`  
+**引擎**: `bun:sqlite`，WAL 日志模式  
+**初始化**: `initDB()` (`fts5.ts:12-54`)
+
+#### 表结构
+
+```sql
+-- 主内容表 (fts5.ts:18-30)
+CREATE TABLE memory_entries (
+    id          TEXT NOT NULL,              -- 条目ID (如 "MEMORY-project-context")
+    project     TEXT NOT NULL,              -- 项目ID
+    content     TEXT NOT NULL,              -- 完整文本内容
+    source      TEXT NOT NULL DEFAULT 'manual',   -- 'manual' | 'reconcile'
+    scope       TEXT NOT NULL DEFAULT 'projects', -- 'global' | 'projects' | 'sessions'
+    type        TEXT NOT NULL DEFAULT 'free',     -- 'memory'|'checkpoint'|'notes'|'progress'|'free'
+    file_path   TEXT NOT NULL DEFAULT '',         -- 相对路径 (如 "MEMORY.md")
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (project, id)
+)
+
+-- FTS5 虚拟表，外部内容模式 (fts5.ts:34-40)
+CREATE VIRTUAL TABLE memory_fts USING fts5(
+    project, id, content, source, scope, type,
+    content='memory_entries',    -- 内容同步到主表
+    content_rowid='rowid'        -- 使用隐式rowid作为外键
+)
+
+-- 插件状态键值存储 (fts5.ts:42-46)
+CREATE TABLE plugin_state (
+    key   TEXT PRIMARY KEY,       -- 语义键名
+    value TEXT NOT NULL           -- 字符串值
+)
+```
+
+**FTS5 外部内容模式**: `content='memory_entries'` 意味着 FTS5 不存储自己的内容副本，而是直接从 `memory_entries` 表读取。每次修改内容表后，必须执行 `INSERT INTO memory_fts(memory_fts) VALUES('rebuild')` 来强制重新索引。这种模式节省存储空间，但增加了写入时的重建开销。
+
+#### `plugin_state` 的用途
+
+| 键模式 | 示例值 | 用途 | 写入位置 |
+|--------|--------|------|----------|
+| `fingerprint:<relPath>` | `"12345-1712345678901"` | 文件的 `size-mtimeMs` 指纹，用于跳过未变更文件 | `fts5.ts:78` |
+| `watermark:<sessionID>` | `"msg_abc123"` | 该会话最后一次 checkpoint 对应的消息ID | `hooks.ts:521` |
+| `injected:<projectID>:<sessionID>` | `"1"` | 注入哨兵，确保每个会话只注入一次 | `hooks.ts:404` |
+
+#### 迁移策略
+
+`fts5.ts:31-33` 使用 `try/catch` 进行无痛迁移：每行 `ALTER TABLE ADD COLUMN` 独立包裹，已存在的列报错被静默忽略。
+
+### 2.2 文件系统布局
+
+```
+<worktree>/.opencode/memory/
+│
+├── MEMORY.md                             # 项目级持久知识 (4 节，模板: checkpoint.ts:208-230)
+│   ├── ## Project context                # 项目是什么，目标是什么
+│   ├── ## Rules                          # 用户声明的硬性约束
+│   ├── ## Architecture decisions         # 重大设计选择 + 理由
+│   └── ## Discovered durable knowledge   # 从 checkpoint 提升的跨会话事实
+│
+├── sessions/<sessionID>/
+│   ├── checkpoint.md                     # 会话结构化状态 (11 节，模板: checkpoint.ts:149-206)
+│   │   ├── §1 Active intent             # 逐字引用的用户最新请求
+│   │   ├── §2 Next concrete action      # 单一可验证的下一步
+│   │   ├── §3 Directives (this session) # 会话特定的工作风格
+│   │   ├── §4 Task tree                 # 来自 task 工具的层级任务树
+│   │   ├── §5 Current work              # checkpoint前的当前工作
+│   │   ├── §6 Files and code sections   # 活跃文件 + 单行用途
+│   │   ├── §7 Discovered knowledge      # 跨任务发现 (MEMORY.md 候选)
+│   │   ├── §8 Errors and fixes          # 遇到的错误及解决方案
+│   │   ├── §9 Live resources            # 运行时状态 (分支、进程、产物)
+│   │   ├── §10 Design decisions         # 无代码产物的决策
+│   │   └── §11 Open notes               # 杂项
+│   ├── checkpoint.md.bak                 # 写入前快照 (崩溃恢复)
+│   ├── notes.md                          # 主代理自由便签本 (模板: checkpoint.ts:232-236)
+│   └── tasks/<taskID>/
+│       └── progress.md                   # 子代理写入的每任务进度日志
+│
+└── memory.db                             # FTS5 索引数据库 (TODO: 尚未实现本地副本，当前使用全局DB)
+
+~/.local/share/opencode/
+├── opencode.db                           # 主轨迹数据库 (Drizzle ORM，内存插件只读)
+├── memory.db                             # 全局 FTS5 索引数据库
+├── memory/global/MEMORY.md               # 跨项目全局记忆
+└── log/opencode.log                      # 插件日志
+```
+
+### 2.3 条目粒度策略 (`fts5.ts:92-118`)
+
+不同类型的文件采用不同的拆分策略：
+
+| 文件 | 拆分方式 | FTS5 `type` | 说明 |
+|------|----------|-------------|------|
+| `MEMORY.md` | 按 `## ` 节标题分割 | `"memory"` | 每节成为独立条目，支持节级别搜索 |
+| `checkpoint.md` | 整个文件 | `"checkpoint"` | 不拆分，整体索引 |
+| `notes.md` | 整个文件 | `"notes"` | 不拆分 |
+| `tasks/*/progress.md` | 整个文件 | `"progress"` | 不拆分 |
+
+**分类逻辑** (`fts5.ts:251-267`): `classifyPath()` 根据路径前缀判断 `scope`（`global/`/`projects/`/`sessions/`），`detectType()` 根据文件名推断类型。
+
+### 2.4 主轨迹数据库 (`opencode.db`)
+
+**位置**: `~/.local/share/opencode/opencode.db`  
+**管理**: Drizzle ORM (由 core 包管理)，内存插件以只读模式访问  
+**用途**: `trajectory_search` 工具查询历史会话、消息、工具调用  
+
+涉及的表:
+- `session`: 项目/会话/目录/标题/时间元数据，`parent_id`，`agent`
+- `message`: 用户和助手轮次，含 `role` 和 token 计数
+- `part`: 文本片段、工具调用、工具结果、步骤边界
+- `task` / `task_event`: 任务状态和进度事件
+- `actor_registry`: 子代理/后台代理历史
+
+---
+
+## 3. 核心子系统
+
+### 3.1 Memory — FTS5 搜索引擎
+
+Memory 子系统提供跨会话知识的写入、索引和全文搜索能力。
+
+#### 3.1.1 延迟同步策略 (`fts5.ts:271-296`)
+
+```
+搜索触发 → 检查距上次同步是否 ≥ 30秒 → 是 → reconcile() → 执行搜索
+                                    → 否 → 直接搜索
+```
+
+**设计理由**: 避免连续快速搜索时过度同步。30 秒冷却 (`RECONCILE_COOLDOWN_MS = 30_000`) 在数据新鲜度和性能之间取得平衡。
+
+#### 3.1.2 指纹增量索引 (`fts5.ts:67-88`)
+
+```
+makeFingerprint(absPath):
+  statSync → { size, mtimeMs }
+  return "size-mtimeMs"
+
+索引流程:
+  fp = makeFingerprint(absPath)
+  cached = getFingerprint(relPath)  -- 从 plugin_state 读取
+  if fp == cached → 跳过 (约 95% 的同步操作)
+            else → parseEntries() → replaceFileEntries() → setFingerprint()
+```
+
+指纹值格式为 `"12345-1712345678901"`（文件大小-最后修改时间毫秒），确保仅在文件内容实际变更时才重新解析和索引。
+
+#### 3.1.3 全量同步 (`fts5.ts:176-206`)
+
+```typescript
+reconcile(worktree, project):
+  1. walkMdFiles() → 递归收集所有 .md 文件
+  2. 对每个文件:
+     fp = makeFingerprint(absPath)
+     if cachedFP === fp → 跳过
+     else → parseEntries() → replaceFileEntries() → setFingerprint()
+  3. pruneDead(): 删除磁盘上已不存在的条目的数据库行
+```
+
+`replaceFileEntries()` (`fts5.ts:121-142`) 在单个事务中执行:
+1. `DELETE` 该文件的所有旧条目
+2. `INSERT` 新条目
+3. `INSERT INTO memory_fts(memory_fts) VALUES('rebuild')` 强制 FTS5 重新索引
+
+#### 3.1.4 BM25 搜索 (`fts5.ts:284-329`)
+
+```typescript
+search(term, project, limit, scope?, type?, opts?):
+  1. 如果距上次同步 ≥ 30秒 → reconcile()   // 延迟同步
+  2. buildFtsQuery(raw)                     // 构建 FTS5 查询字符串
+  3. FTS5 BM25 查询 (3×limit 候选)
+  4. 分数取反: score = -bm25 值 (越高越好)
+  5. 相对分数过滤: 保留 score >= topScore × floorRatio 的结果
+  6. 截断到 limit
+```
+
+**查询构建** (`fts5.ts:274-281`):
+```
+"hello world 测试" → "\"hello\" OR \"world\" OR \"测试\""
+```
+使用 Unicode 感知的正则表达式 `[\p{L}\p{N}_]+` 进行分词，不做词干提取或停用词过滤。
+
+**分数取反**: SQLite FTS5 的 `bm25()` 返回**越低越好**（负数越负越相关）。代码在 `search()` 内对每个结果执行 `score = -r.score` 取反，使**越高越好**（对齐 MiMo-Code 实现），再用相对分数过滤。
+
+**相对分数过滤**: 不使用固定绝对阈值，而是使用 `topScore × floorRatio`。默认 `floorRatio=0.15` 意味着只保留分数不低于最高分 15% 的结果（#1 命中永远保留）。设为 0 可禁用过滤。这种方法自适应不同的查询相关性分布。
+
+#### 3.1.5 内存写入/编辑工具
+
+`memory_write` 和 `memory_edit` 工具 (`memory-tool.ts`) 在执行文件操作前后有严格的路径安全校验:
+
+```
+路径安全校验:
+  resolve(target) → 规范化路径
+  isUnder(memoryRoot, resolved):
+    root = ".opencode/memory/"
+    return target === root || target.startsWith(root + sep)
+  
+写入后自动索引:
+  memoryWrite/Edit 成功后 → indexFile(absPath, project.id)
+    → 指纹检查 (跳过无变化) → parseEntries() → replaceFileEntries()
+```
+
+### 3.2 Checkpoint — 会话状态压缩
+
+Checkpoint 是系统的核心机制，将长对话历史压缩为结构化文档，使 LLM 在上下文窗口受限时仍能保持对任务状态的感知。
+
+#### 3.2.1 动态 Token 阈值 (`hooks.ts:61-100`)
+
+```
+窗口大小依赖的阈值密度:
+
+  windowSize < 25K:   []                          -- 不生成 checkpoint (窗口太小)
+  25K ≤ ws ≤ 200K:    [20%, 40%, 60%, 80%]        -- 4 个阈值
+  200K < ws ≤ 500K:   [10%, 20%, ..., 90%]        -- 9 个阈值 (10% 步进)
+  ws > 500K:          [5%, 10%, ..., 90%]         -- 18 个阈值 (5% 步进)
+
+安全边界: 每个阈值不超过 (windowSize - 13,000) 的 CHECKPOINT_RESERVED
+```
+
+**计算细节** (`hooks.ts:72-100`):
+- 支持相对值 (`"40%"`)、绝对值 (`"100K"`、`"1.5M"`、`"80000"`)
+- `resolveThresholds()` 解析后去重、排序、限制最大值为 `windowSize - 13000`
+- 如果第一个阈值超过安全边界，则压缩到安全边界值
+
+**用户自定义阈值** 通过 `cfg.checkpoint.thresholds` 配置，覆盖默认密度调度。
+
+#### 3.2.2 触发流程
+
+```
+experimental.assistant.tokens 钩子触发 (每个助手轮次后)
+  │
+  ├─ 子会话防护: inp.parentID 存在 → return (子代理不触发 checkpoint)
+  │
+  ├─ 累计 token: ck.total += (input + output)
+  │
+  └─ 检查阈值:
+        idx = nextThresholdIdx[sessionID] ?? 0
+        if ck.total - ck.lastWrite >= checkpointThresholds[idx]:
+          ├─ ck.lastWrite = ck.total              // 更新水位
+          ├─ nextThresholdIdx[sessionID] = idx + 1 // 推进到下一阈值
+          └─ trySpawnCheckpointWriter()
+```
+
+**子会话跳过**: `prompt.ts` 在 `experimental.assistant.tokens` hook payload 中传入 `parentID`（`session.parentID`），子代理（task 工具、writer 子会话等）的 token 不再进入 `checkpointTokens` 累计，从源头避免无意义的 checkpoint 触发。
+
+#### 3.2.3 Writer 状态机 (`checkpoint.ts:360-440`)
+
+```
+三态状态机:
+
+  Idle (state.writing === null)
+    └─ 新请求 → 立即启动 Writer
+
+  Writing (state.writing = { promise, resolve })
+    └─ 新请求 → 排队到 1 槽位 pending (新覆盖旧)
+      理由: 新的 checkpoint 范围严格包含旧范围
+
+  Consuming Pending
+    └─ Writer 完成后检查 pending → 若存在则立即启动
+```
+
+**WriterHandle 的时序保证** (`checkpoint.ts:507-514`):
+```typescript
+// 关键: 在 fork+prompt 之前创建 handle
+let resolveHandle: () => void
+const promise = new Promise<void>((resolve) => { resolveHandle = resolve })
+state.writing = { promise, resolve: resolveHandle! }
+
+// 然后才开始 fork...
+// 如果先 fork 再创建 handle，compaction 可能在间隙中看到 "no-writer"
+// 并带着过时的 checkpoint 继续
+```
+
+失败时回滚: `state.writing = null + resolveHandle!()` 确保没有等待者挂起。
+
+#### 3.2.4 Writer 子代理完整流程 (`checkpoint.ts:466-617`)
+
+```
+trySpawnCheckpointWriter(client, input, worktree, lastCheckpointMessageID):
+
+  1. 防护检查:
+     ├─ isSystemSession? → "skipped"  (防递归: 不检查 checkpoint-writer/dream/distill)
+     └─ parentID 存在? → "skipped"    (子代理不生成 checkpoint)
+
+  2. 引导 (如果不存在则创建模板):
+     ├─ bootstrapCheckpoint() → checkpoint.md (11节模板)
+     ├─ bootstrapNotes()      → notes.md
+     └─ bootstrapMemory()     → MEMORY.md + 迁移 memory.md → MEMORY.md
+
+  3. 排队检查:
+     if state.writing → state.pending = {input, worktree, ...} → "queued"
+
+  4. 创建 WriterHandle (时序关键)
+
+  5. 快照: snapshotCheckpoint() → cp checkpoint.md checkpoint.md.bak
+
+   6. Fork 父会话:
+      client.session.fork({ messageID, parentID: input.sessionID }) → childID
+      // parentID 使 writer 子会话成为正式子会话 (session 列表不显示)
+
+  7. 标记角色: markSession(childID, "checkpoint-writer")
+
+  8. 构建提示词上下文:
+     ├─ rangeDesc: 覆盖的消息范围
+     ├─ dedupHint: 已有 SSD7 标题 (避免重复)
+     ├─ retryContext: 重试时的修复指令
+     └─ 节预算: §1:500, §2:1000, §3:800, ..., 总预算:13,000 tokens
+        (含 CHECKPOINT_PATH / MEMORY_PATH / TASK_MEM_DIR / NOTES_PATH 绝对路径)
+
+   9. 发送异步提示: client.session.promptAsync({ agent: "checkpoint-writer" })
+      // promptAsync 将 agent loop fork 到后台 fiber，立即返回
+      // 注意: 不能加 noReply: true — 那会跳过 agent loop，子会话永不完成
+
+   10. 建立映射: childToParent.set(childID, parentID)  (仅在 prompt 成功后)
+
+   11. 失败回滚: state.writing = null + resolveHandle()
+```
+
+#### 3.2.5 Writer 完成与验证流程 (`hooks.ts:593-720`)
+
+```
+session.idle 或 session.deleted 事件触发 (子代理完成):
+
+  1. 直接查父会话: getWriterParent(sid) → parentID
+     └─ 无 parentID? → 不是 writer 子代理，跳过
+
+  2. 清理子代理跟踪: cleanupWriterChild(sid)
+
+  3. 完成 Writer: settleWriter(sessionID) → resolve promise → compaction 解除阻塞
+
+  4. 验证 checkpoint: validateCheckpoint(sessionID, worktree)
+     ├─ 13 条规则检查 (见 3.2.6)
+     └─ logViolations()
+
+  5. 处理验证结果:
+     ├─ 有 errors:
+     │   ├─ 仅 subsection-missing?
+     │   │   ├─ 是 → 保留部分内容 (对齐 MiMo-Code actor 续写模型)
+     │   │   └─ 否 → restoreCheckpointFromBackup()   // 恢复 .bak
+     │   ├─ retryCount < 3?
+     │   │   ├─ 是 → trySpawnCheckpointWriter({retryContext: 详细错误})
+     │   │   └─ 否 → retryCount.delete() + deleteCheckpointBackup() (放弃)
+     │   └─ (重试时带着 violation 详情，让 writer 修复)
+     │
+     └─ 无 errors:
+         ├─ retryCount.delete()
+         ├─ 推进水位: watermark:<sessionID> = latestMsgID
+         ├─ deleteCheckpointBackup()   // 删除 .bak
+         └─ Log checkpoint_saved
+
+  6. 消费 pending 队列:
+     if wstate.pending:
+       → trySpawnCheckpointWriter(wstate.pending.input, ...)
+```
+
+**终态事件**: writer 子代理完成后的终态是 `session.idle`（而非 `session.deleted`），两个事件都作为完成信号处理。
+
+#### 3.2.6 13 条验证规则 (`checkpoint-validator.ts:70-230`)
+
+| # | 规则名 | 严重性 | 检查内容 |
+|---|--------|--------|----------|
+| 1 | `file-missing` | error | 文件是否存在 |
+| 2 | `empty-file` | error | 文件是否为空 |
+| 3 | `topic-missing` | error | 首行是否为 `# Session checkpoint` |
+| 4 | `topic-too-long` | warn | 首行是否 > 80 字符 |
+| 5 | `topic-anti-pattern-checkpoint-header` | error | 首行不能是旧格式 `# Checkpoint #N` |
+| 6 | `subsection-missing` | error | 11 个节是否全部存在 |
+| 7 | `subsection-out-of-order` | warn | 节顺序是否与模板一致 |
+| 8 | `section-budget-exceeded` | warn | 每节 token 是否超过预算的 120% |
+| 9 | `next-filler` | warn | §2 是否含填充文本 `(none yet)` |
+| 10 | `discovered-duplicate-title` | warn | §7 是否有重复标题 |
+| 11 | `discovered-missing-why` | warn | §7 条目是否有 `Why:` 行 |
+| 12 | `discovered-missing-how-to-apply` | warn | §7 条目是否有 `How to apply:` 行 |
+| 13 | `meta-malformed-json` | warn | JSON 块是否有效 |
+
+**节预算** (`checkpoint-validator.ts:27-39`):
+
+| 节 | 预算 (tokens) |
+|----|---------------|
+| §1 Active intent | 500 |
+| §2 Next concrete action | 1,000 |
+| §3 Directives | 800 |
+| §4 Task tree | 1,000 |
+| §5 Current work | 2,000 |
+| §6 Files and code sections | 1,500 |
+| §7 Discovered knowledge | 2,000 |
+| §8 Errors and fixes | 1,500 |
+| §9 Live resources | 1,000 |
+| §10 Design decisions | 3,000 |
+| §11 Open notes | 800 |
+| **总计** | **13,000** |
+
+注意: 预算超标检查使用 120% 容忍度 (`budget * 1.2`)，给予 LLM 一定的灵活性。
+
+#### 3.2.7 崩溃安全机制
+
+```
+写入前:  snapshotCheckpoint()  →  cp checkpoint.md checkpoint.md.bak
+写入中:  LLM 子代理修改 checkpoint.md
+写入后:  validateCheckpoint()
+          ├─ 通过 → deleteCheckpointBackup()  →  rm checkpoint.md.bak
+          └─ 失败 → 分类处理:
+                ├─ 仅 subsection-missing → 保留部分内容，重试补缺口
+                └─ 其他错误 → restoreCheckpointFromBackup()  →  cp .bak checkpoint.md
+                             └─ 重试 (最多 3 次)
+```
+
+**备份函数** (`checkpoint.ts:311-338`):
+- `snapshotCheckpoint()`: 将现有 checkpoint.md 复制为 `.bak`
+- `restoreCheckpointFromBackup()`: 将 `.bak` 恢复为 checkpoint.md（恢复后自动删除 `.bak`）
+- `deleteCheckpointBackup()`: 删除 `.bak` 文件（含成功/放弃重试两条路径）
+
+**部分内容保留**: 当验证失败的唯一原因是 `subsection-missing`（缺少节标题）时，不恢复备份——部分已完成的内容有有效值，重试 writer 只需填补缺失的节。这避免了从头重写的 token 浪费，对齐 MiMo-Code 的 actor 续写模型。
+
+#### 3.2.8 Writer 提示词设计要点 (`checkpoint-writer.txt`)
+
+提示词包含以下精心设计的约束:
+
+1. **路径纪律**: 只使用提示中给出的绝对路径，不使用对话历史中出现的路径（可能是旧引用）
+2. **两轮工作流程**: Turn 1 并行读取所有源文件 → Turn 2a 协调决策 → Turn 2 并行发出 Edit
+3. **任务树来源**: 必须调用 `task` 工具（操作="list"）获取权威任务状态，不得根据对话臆造
+4. **§1 更新规则**: 仅当用户发出 COMMITMENT 型动词（implement, write, build, fix, 等）时更新；INSPECTION 型（find, list, show, tell）保持 §1 不变
+5. **verbatim 保留**: 连接字符串、端口、文件路径等必须逐字保留（byte-for-byte），不得转述
+6. **§3 与 MEMORY.md 去重**: 如果 §3 中的规则在 MEMORY.md Rules 中已存在，则删除 §3 中的行
+7. **防重复**: 给 writer 提供已有 §7 标题列表，避免重复发现
+8. **notes.md 重置**: Turn 2 结束时用 Write 工具将 notes.md 重置为模板（所有条目已被协调处理）
+
+### 3.3 Dream — 记忆整合
+
+Dream 负责跨会话的知识去重与整理，将 checkpoint 中发现的持久事实合并到 MEMORY.md。
+
+#### 3.3.1 触发机制
+
+```
+自动触发 (session.pre 钩子):
+  shouldSkipAuto(config, projectID, "dream", lastDreamSpawnTime):
+    ├─ config.auto === false     → "disabled"  (静默跳过，不记录日志)
+    ├─ 距上次生成 < 10秒          → "spawn_gap"  (防抖)
+    ├─ 上次 dream < 7天           → "interval"
+    └─ 无历史 dream 且项目 < 7天  → "too_young"
+
+手动触发 (命令系统):
+  用户输入 /dream → 命令系统路由到 dream agent (cfg.command 注册)
+```
+
+#### 3.3.2 子代理执行算法 (`dream.txt`)
+
+```
+Phase 0 — 定位数据:
+  memory_search (broad queries) → Glob/Read 内存文件 → bash 定位 opencode.db
+
+Phase 1 — 定向:
+  Read 当前 MEMORY.md → Read 当前 notes.md → Glob 最近 checkpoint → SQLite 列出最近会话
+
+Phase 2 — 收集 (从内存文件):
+  最近 checkpoint → §7 (发现) / §8 (错误修复) / §10 (决策) → tasks/*/progress.md → notes.md
+
+Phase 3 — 验证 (对照原始轨迹):
+  SQLite 查询 session/message/part 表:
+    关键词: "always"/"never"/"remember"/"rule"/"decision"/"decided"/"tradeoff"
+    重复命令序列、重复文件路径、重复错误文本
+  仅在有多个会话证据或用户明确声明时才提升事实
+
+Phase 4 — 整合 (编辑 MEMORY.md):
+  - 合并重复 (不追加)
+  - 相对日期 → YYYY-MM-DD
+  - 删除矛盾/过时条目
+  - 每条目 1-3 行
+  - 保留来源会话 ID [ses_xxx]
+
+Phase 5 — 修剪与验证:
+  - MEMORY.md < 200 行且 < 10KB
+  - Glob 验证文件路径
+  - Grep 验证函数/类名
+  - 不可验证的声明标记 [unverified]
+```
+
+**注意**: Dream 提示词明确禁止创建 skills/subagents/commands——那是 `/distill` 的工作。
+
+#### 3.3.3 代码实现 (`dream-distill.ts:72-133`)
+
+```typescript
+// 自动触发
+tryAutoDream(client, sessionID, worktree, config, projectID):
+  reason = shouldSkipAuto(config, projectID, "dream", lastDreamSpawnTime)
+  if reason:
+    if reason !== "disabled" → 记录 "auto_skipped" + reason
+  else:
+    lastDreamSpawnTime = now
+    spawnChildSession(client, sessionID, "dream", DREAM_AUTO_PROMPT)
+```
+
+**防抖**: `lastDreamSpawnTime` 全局变量，每次 spawn 后更新，`shouldSkipAuto` 检查 `now - lastSpawnTime < 10_000` 防止 1 秒内重复触发。
+
+**手动触发**: `/dream` 命令通过 `cfg.command` 注册（`hooks.ts:295-301`），命令系统将 `/dream` 路由到 dream agent，模板为 `DREAM_COMMAND_TEMPLATE`。不再通过 `chat.message` 钩子拦截文本。
+
+### 3.4 Distill — 工作流发现
+
+Distill 负责发现重复的手动工作流并打包为可复用资产（skills、subagents、commands）。
+
+#### 3.4.1 触发机制
+
+```
+自动触发: 30 天间隔 (同 Dream 的门控逻辑)
+手动触发: /distill 命令 (cfg.command 注册，路由到 distill agent)
+```
+
+#### 3.4.2 子代理执行算法 (`distill.txt`)
+
+```
+Phase 0 — 定位数据: 同 Dream
+
+Phase 1 — 盘点现有资产:
+  Glob .opencode/skills/**/SKILL.md, .opencode/agent/**, .opencode/command/**
+  Glob 兼容目录: ~/.claude, ~/.agents, ~/.codex, ~/.opencode
+  记录每个资产已覆盖的内容
+
+Phase 2 — 从内存发现重复工作流:
+  checkpoint.md → 重复任务形状/命令序列
+  tasks/*/progress.md → 多步骤过程
+  MEMORY.md Patterns/Rules → 明确记录的重复问题
+
+Phase 3 — 对照原始轨迹确认:
+  SQLite 查询: GROUP BY tool, input_preview 按频率降序
+  关键词: "again"/"every time"/"like last time"/"the usual"/"repeat"/"same as before"
+  仅当出现 ≥2 次才确认候选
+
+Phase 4 — 候选名单:
+  对每个候选:
+    - 重复工作流 (一行)
+    - 支持证据 + 日期 + [ses_xxx]
+    - 频率/置信度
+    - 推荐形式: skill/subagent/command/extend/skip
+    - 是否值得创建的理由
+
+Phase 5 — 选择最小形式:
+  Skill:        .opencode/skills/<name>/SKILL.md (YAML name + description)
+  Subagent:     .opencode/agent/<name>.md (frontmatter + system prompt)
+  Command:      .opencode/command/<name>.md ($ARGUMENTS 占位符)
+  Extend:       编辑现有资产而非新增
+  Skip:         过于一次性/模糊/敏感/证据不足
+
+Phase 6 — 创建并验证:
+  - 写 .opencode/ 下 (除非用户要求全局)
+  - 复用项目已有的约定和风格
+  - Glob/Grep 验证引用路径
+
+Phase 7 — "没有值得打包的重复工作流" 也是有效结果
+```
+
+#### 3.4.3 代码实现 (`dream-distill.ts:135-200`)
+
+实现结构与 Dream 对称：`tryAutoDistill` 用于自动触发，共享 `shouldSkipAuto` 门控逻辑。手动触发通过 `/distill` 命令（`cfg.command` 注册）。
+
+---
+
+## 4. 上下文注入机制
+
+### 4.1 首次注入 (`hooks.ts:399-412`)
+
+```
+实验性钩子: experimental.chat.system.transform
+触发时机: 每次构建 LLM 请求时的系统提示词阶段
+
+流程:
+  1. 检查注入哨兵: getPluginState("injected:<projectID>:<sessionID>")
+     ├─ 已设置 → 跳过 (本会话已注入过)
+     └─ 未设置:
+         ├─ setPluginState("injected:...", "1")     // 设置哨兵
+         ├─ buildMemoryContext(worktree, sessionID)   // 构建内存上下文
+         │   ├─ MEMORY.md → <memory_context type="persistent"> (10K token 预算)
+         │   └─ checkpoint.md → <memory_context type="checkpoint"> (11K token 预算)
+         └─ out.system.push(ctx)                      // 追加到系统提示词
+
+  2. (总是) 追加 MEMORY_SYSTEM_INSTRUCTIONS:
+     out.system.push(MEMORY_SYSTEM_INSTRUCTIONS)
+     // 包含工具使用说明、命令、自动行为、压缩恢复协议
+```
+
+**XML 包装格式**:
+```xml
+<memory_context type="persistent">
+## Project context
+...
+</memory_context>
+
+<memory_context type="checkpoint">
+## §1 Active intent
+...
+</memory_context>
+```
+
+### 4.2 压缩后重建上下文 (`injection.ts:46-146`)
+
+重建上下文比首次注入更复杂，不仅包含 checkpoint 和 memory，还包含 notes、global memory、最近用户输入和索引路径。
+
+```
+buildRebuildContext(sessionID, worktree, opts):
+
+  读取 4 个文件 (节感知截断):
+    checkpoint.md     → 11,000 token (readBudgetedSectionAware)
+    MEMORY.md         → 10,000 token (readBudgeted: 70%头部 + 30%尾部)
+    notes.md          →  6,000 token (readBudgetedSectionAware)
+    global/MEMORY.md  →  6,000 token (readBudgetedSectionAware)
+
+  组装为结构化块:
+    ## Session checkpoint (checkpoint.md)
+    (截断内容)
+
+    ## Project memory (MEMORY.md)
+    (截断内容)
+
+    ## Session notes (notes.md)
+    (截断内容)
+
+    ## Global memory (global/MEMORY.md)
+    (截断内容)
+
+    ## Recent user input (verbatim)
+    ``` (最多 2000 字符) ```
+
+    ## Memory keys index
+    其他可用的内存文件路径 (最多 20 条)
+
+  追加恢复指令:
+    - Active recall protocol: 不要重读完整文件，用 Grep 搜索关键词
+    - Compaction artifact recovery: 如何处理孤立的 tool_use/tool_result
+```
+
+### 4.3 截断策略 (`injection.ts:148-199`)
+
+**两种截断方式**:
+
+1. **`truncateByTokenBudget()`** (`injection.ts:154-159`):
+   - 简单尾部截断: `text.slice(0, charBudget)`
+   - 用于首次注入
+
+2. **`readBudgeted()`** (`injection.ts:166-178`): 
+   - 头尾分割: 70% 头部 + 30% 尾部，中间插入 `⚠️ Truncated` 标记
+   - 用于 MEMORY.md（非分节文件）在压缩重建中
+
+3. **`readBudgetedSectionAware()`** (`injection.ts:180-198`):
+   - 按 `## ` 节边界累积，直到下一节会超出预算
+   - 保持完整节不被中间截断
+   - 标记剩余 token 数并附文件路径指针
+
+**Token 估算**: 简单的 `Math.ceil(text.length / 4)` — 假设平均每 4 字符对应 1 token。
+
+---
+
+## 5. 会话压缩与重建
+
+### 5.1 压缩边界计算 (`checkpoint.ts:8-145`)
+
+```
+computeBoundary(msgs):
+  目的: 在会话压缩时，找到应保留的消息窗口的起始 ID
+
+  算法:
+    1. 找到最后一个已完成的助手消息 (finish !== undefined)
+    2. 从该消息前一个位置开始，计算尾部 token 和文本块数
+    3. 目标: 10K-20K token, 至少 5 个文本块
+    4. 不足则向前扩展
+    5. adjustBoundary(): 修正工具配对
+
+  adjustBoundary():
+    Step 1 — 工具配对:
+      收集尾部所有 tool_use 和 tool_result
+      找到在尾部有 result 但 use 在头部中的 "孤儿"
+      向前扩展边界到包含 use
+    Step 2 — thinking block:
+      相同 message.id 的 thinking 块和助手消息放在同一边界
+```
+
+**文本块计数** (`checkpoint.ts:21-23`): `hasTextBlocks(m)` 检查是否有 `type === "text"` 或 `type === "reasoning"` 的 part，确保 LLM 在压缩后有足够的人类可读锚点。
+
+### 5.2 可压缩工具识别 (`hooks.ts:105-138`)
+
+```typescript
+COMPACTABLE_TOOLS = Set([
+  "read", "view_image", "bash", "grep", "glob", "webfetch", "websearch",
+  "edit", "write", "multiedit", "apply_patch", "codesearch",
+])
+// 这些工具的输出量大但可再生 → 压缩为 "[compact: N tokens]"
+
+PRUNE_PROTECTED_TOOLS = Set(["actor", "task", "question", "skill", "memory", "ask_user"])
+// 这些工具的结果可能被后续轮次引用 → 保留完整内容
+```
+
+`computeCompactable()` 函数遍历边界后的用户消息（包含工具结果），将含有可压缩工具结果的消息ID收集起来。
+
+### 5.3 压缩时钩子交互 (`hooks.ts:428-446`)
+
+```
+experimental.session.compacting 钩子:
+  1. waitForWriter(sessionID, 30_000)   // 等待进行中的 checkpoint writer
+     - 返回 "success": writer 已完成，checkpoint 是最新的
+     - 返回 "timeout": 30秒超时，checkpoint 可能不是最新 (但至少是可用的)
+     - 返回 "no-writer": 没有 writer 在运行
+
+  2. collectRecentUserInput(msgs, 3_000) // 收集最近 3,000 字符的用户输入
+     - 从后向前遍历，只收集 role === "user" 的消息
+     - 超过 maxChars 时从头部截断
+
+  3. buildRebuildContext(...)             // 构建重建提示词 (见 4.2)
+
+  4. computeBoundary(msgs)                // 计算边界消息 ID
+  5. computeCompactable(msgs, boundaryID) // 识别可压缩消息
+
+experimental.compaction.autocontinue 钩子:
+  out.enabled = false  // 禁用自动续写 (内存插件接管上下文管理)
+```
+
+### 5.4 压缩产物恢复协议
+
+注入到系统提示词中的恢复指令 (`memory-system.ts:44-50`):
+
+```
+- 不要回应孤立的 tool_use —— 它们是压缩产物
+- 可安全重新运行的工具: read, bash, grep, glob, webfetch, websearch, edit, write
+- 有状态的工具结果已保留: actor, task, skill
+```
+
+辅以 `adjustBoundary()` 的后向遍历，配对孤立的工具调用和结果。
+
+---
+
+## 6. 钩子集成全景
+
+| 钩子 | 触发时机 | 文件:行 | 方向 | 作用 |
+|------|----------|---------|------|------|
+| `config` | 插件初始化 | `hooks.ts:201-308` | 入站 | 注册 3 个子代理 + 2 个命令，读取 dream/distill/checkpoint 配置 |
+| `chat.params` | 模型参数确定时 | `hooks.ts:312-320` | 入站 | 捕获上下文窗口 → 计算动态阈值表 |
+| `session.pre` | 每次新会话开始 | `hooks.ts:492-497` | 入站 | 检查 auto-dream / auto-distill 资格 |
+| `experimental.chat.system.transform` | LLM 请求构建 | `hooks.ts:499-513` | 入站 | 首次注入内存上下文 + 每次追加系统指令 |
+| `command.execute.before` | 命令执行前 | `hooks.ts:515-519` | 入站 | 记录 /dream、/distill 命令触发 |
+| `chat.message` | 用户消息到达时 | `hooks.ts:521-529` | 入站 | 追踪 lastMessageIDs（供 checkpoint watermark 使用） |
+| `experimental.assistant.tokens` | 每个助手轮次后 | `hooks.ts:557-591` | 入站 | 跳过子会话，累计 token，触发 checkpoint writer |
+| `experimental.session.compacting` | 会话压缩时 | `hooks.ts:531-551` | 入站 | 构建重建上下文，计算边界，识别可压缩消息 |
+| `experimental.compaction.autocontinue` | 压缩后自动续写判断 | `hooks.ts:553-555` | 入站 | 禁用自动续写 |
+| `event` (`session.idle`/`session.deleted`) | 子代理会话完成时 | `hooks.ts:593-720` | 事件 | 检测 writer 完成 → 验证 → 重试 → 清理 |
+| `dispose` | 插件销毁时 | `hooks.ts:192-199` | 生命周期 | 清理 writer 状态 + 关闭 DB |
+
+---
+
+## 7. 关键架构决策
+
+### 7.1 基于指纹的增量索引
+
+**文件**: `fts5.ts:67-88`
+
+使用 `statSync` 的 `(size, mtimeMs)` 作为文件指纹，缓存在 `plugin_state`。改变后的文件被替换、未改变的文件被跳过。在后续同步中减少约 95% 的文件读取。
+
+**权衡**: 指纹仅依赖 size + mtime，不检查内容哈希。极端情况下，在 mtime 精度内的多次写入可能漏检。不过对于人工编辑的 Markdown 文件，mtime 变化足以捕捉所有真实修改。
+
+### 7.2 子代理式 Writer 架构
+
+**文件**: `checkpoint.ts:466-617`
+
+将 checkpoint 的内容理解委托给 LLM 子代理，而非用规则引擎解析对话。这提供了对自然语言内容的语义理解，但也带来了 LLM 输出不确定性的挑战。
+
+**缓解措施**:
+- 模板保证初始结构一致
+- 验证规则强制执行结构和预算约束
+- 快照机制支持重试
+- 详细的提示词引导 writer 行为
+
+### 7.3 节感知的 Token 预算截断
+
+**文件**: `injection.ts:180-198`
+
+当 checkpoint 内容超出注入预算时，截断保持在完整的节边界上（以 `## ` 开头的行），而非随意在句子中间截断。对于非分节文件，使用 70% 头部 + 30% 尾部的分割方式。
+
+这确保 LLM 始终看到完整、连贯的语义单元。
+
+### 7.4 基于模板的引导
+
+**文件**: `checkpoint.ts:149-236`
+
+所有内存文件 (`MEMORY.md`, `checkpoint.md`, `notes.md`) 从斜体指令文本和占位符的模板创建。`_斜体行_` 用于提示内容应填写的内容，而 `(none yet)` 占位符仅在实际内容出现时被替换。
+
+**优点**: 
+- 即使没有 writer 运行过，结构也是确定性的
+- 验证器可以对未见过的内容检测结构异常
+
+### 7.5 BM25 相对分数过滤
+
+**文件**: `fts5.ts:319-327`
+
+先对每个结果的 `bm25()` 分数取反（越低越好 → 越高越好），再使用 `topScore × floorRatio` 相对过滤。默认 `floorRatio=0.15` 意味着只保留分数不低于最高分 15% 的结果（#1 命中永远保留）。这适应了不同的查询相关性分布 — 对于 "命中" 的查询返回多个结果，对于 "未命中" 的查询严格过滤。
+
+### 7.6 崩溃安全 (快照 + 重试 + 部分保留)
+
+**文件**: `checkpoint.ts:311-338` + `hooks.ts:634-686`
+
+在 LLM writer 开始修改 checkpoint.md 之前，文件被快照到 `checkpoint.md.bak`。如果输出未通过 13 条验证规则，分类处理：
+
+- **仅 subsection-missing**：保留部分完成内容，重试时只补缺失的节（对齐 MiMo-Code actor 续写模型，避免从头重写）
+- **其他错误**：恢复备份并重试（最多 3 次）
+
+验证通过或放弃重试后删除备份。
+
+这保证了: 即使 writer LLM 崩溃、产生格式错误的输出、或未完成所有编辑，下次 writer 始终从已知的清洁状态开始，并重新覆盖相同的增量。
+
+### 7.7 每个文件的条目粒度
+
+**文件**: `fts5.ts:92-118`
+
+- **MEMORY.md**: 按 `## ` 节标题分割 → 每个节成为独立的搜索条目
+- **checkpoint.md**: 作为单个条目存储
+- **notes.md, progress.md**: 各为单个条目
+
+这允许节级别的搜索结果，如搜索 "Rules" 时直接定位到 MEMORY.md 的 Rules 节。
+
+### 7.8 注入哨兵模式
+
+**文件**: `hooks.ts:403-404`
+
+使用 `plugin_state` 中的 `injected:<projectID>:<sessionID>` 键作为注入哨兵，确保 MEMORY.md + checkpoint.md 在每个会话中只注入一次。这防止了在多次 LLM 调用中重复注入同一内容，节省上下文窗口。
+
+### 7.9 系统会话递归防护
+
+**文件**: `agent.ts` + `checkpoint.ts:486-489` + `hooks.ts:558`
+
+`isSystemSession()` 检查 `roles` Map，防止 checkpoint-writer、dream、distill 子代理触发新的 checkpoint writer，避免无限递归。`experimental.assistant.tokens` 钩子通过 `inp.parentID` 在源头跳过所有子会话。
+
+### 7.10 1槽位 pending 队列
+
+**文件**: `checkpoint.ts:369-377`, `hooks.ts:501-505,566-584`
+
+当 writer 正在运行时，新的 checkpoint 请求排队到 1 个槽位。新请求覆盖旧请求，因为新的 checkpoint 范围严格包含旧范围。这避免了 writer 积压。
+
+---
+
+## 8. 配置与调优
+
+### 8.1 配置文件 (`opencode.json` 或 `config.yaml`)
+
+```yaml
+checkpoint:
+  # 动态 token 阈值。支持相对值 ("40%") 和绝对值 ("100K"、"1.5M")。
+  # 为空或省略时回退到基于密度的默认值。
+  thresholds: ["40%", "60%", "80%"]
+  
+  # BM25 相对分数过滤系数。默认 0.15。
+  # 0 → 禁用过滤（返回所有匹配）；越高 → 越严格（只保留高相关结果）。
+  search_score_floor: 0.15
+
+dream:
+  auto: false          # 启用自动 dream (默认: false)
+  interval_days: 7     # 自动 dream 间隔天数 (默认: 7)
+
+distill:
+  auto: false          # 启用自动 distill (默认: false)
+  interval_days: 30    # 自动 distill 间隔天数 (默认: 30)
+```
+
+### 8.2 阈值格式 (`hooks.ts:72-85`)
+
+| 格式 | 示例 | 含义 |
+|------|------|------|
+| 百分比 | `"40%"` | `Math.floor(windowSize × 40 / 100)` |
+| K 后缀 | `"100K"` | `100,000` |
+| M 后缀 | `"1.5M"` | `1,500,000` |
+| 纯数字 | `"80000"` | `80,000` |
+
+### 8.3 子代理权限
+
+| 代理 | 模式 | 隐藏 | 工具权限 |
+|------|------|------|----------|
+| `checkpoint-writer` | subagent | 是 | read, write, edit, apply_patch, glob, grep, task, memory_write, memory_edit |
+| `dream` | subagent | 是 | read, write, edit, apply_patch, glob, grep, task, bash, memory_search, trajectory_search, memory_write, memory_edit |
+| `distill` | subagent | 是 | read, write, edit, apply_patch, glob, grep, task, bash, memory_search, trajectory_search, memory_write, memory_edit |
+
+三个子代理都被标记为 `hidden: true`，不在可用子代理列表中显示。checkpoint-writer 没有 `bash` 权限——只能操作内存文件；dream/distill 需要 `bash` 做只读 SQLite 和文件系统检查，且有 memory_search/trajectory_search 权限探索现有知识和轨迹。
+
+### 8.4 日志系统
+
+**日志文件**: `~/.local/share/opencode/log/opencode.log`  
+**格式**: `ISO时间戳 [级别] [memory:模块] 消息 {JSON扩展}`  
+**级别**: INFO / WARN / ERROR  
+**实现**: 所有日志函数都在 `try/catch` 中，日志失败不会崩溃插件
+
+---
+
+## 附录: 关键常量速查
+
+| 常量 | 值 | 位置 | 说明 |
+|------|-----|------|------|
+| `CHECKPOINT_RESERVED` | 13,000 | `hooks.ts:92` | 安全边界 token 数 |
+| `TAIL_MIN_TOKENS` | 10,000 | `checkpoint.ts:13` | 压缩后最小尾部 token |
+| `TAIL_MAX_TOKENS` | 20,000 | `checkpoint.ts:14` | 压缩后最大尾部 token |
+| `TAIL_MIN_TEXT_BLOCK_MESSAGES` | 5 | `checkpoint.ts:15` | 最小文本块消息数 |
+| `RECONCILE_COOLDOWN_MS` | 30,000 | `fts5.ts:272` | 同步冷却时间 |
+| `MIN_SPAWN_GAP_MS` | 10,000 | `dream-distill.ts:12` | Dream/Distill 生成最小间隔 |
+| `MAX_RETRIES` | 3 | `hooks.ts:77` | Checkpoint 写入最大重试次数 |
+| `DEFAULT_SCORE_FLOOR` | 0.15 | `hooks.ts:75` | BM25 默认相对分数过滤系数 |
+| `SECTION_BUDGET_TOTAL` | 13,000 | `checkpoint-validator.ts:43` | Checkpoint 总 token 预算 |
+| `FIRST_INJECT_MEMORY_BUDGET` | 10,000 | `injection.ts:18` | 首次注入 MEMORY.md 预算 |
+| `FIRST_INJECT_CHECKPOINT_BUDGET` | 11,000 | `injection.ts:28` | 首次注入 checkpoint.md 预算 |
+| `REBUILD_CHECKPOINT_BUDGET` | 11,000 | `injection.ts:53` | 重建时 checkpoint 预算 |
+| `REBUILD_MEMORY_BUDGET` | 10,000 | `injection.ts:57` | 重建时 MEMORY.md 预算 |
+| `REBUILD_NOTES_BUDGET` | 6,000 | `injection.ts:61` | 重建时 notes.md 预算 |
+| `REBUILD_GLOBAL_BUDGET` | 6,000 | `injection.ts:63` | 重建时 global/MEMORY.md 预算 |
+| `RECENT_USER_INPUT_MAX_CHARS` | 3,000 / 2,000 | `hooks.ts:431` / `injection.ts:96` | 最近用户输入最大字符数 |
+
+---
+
+*文档基于 `packages/opencode/src/plugins/memory/` 源码生成，涵盖 hooks.ts (726行)、fts5.ts (357行)、checkpoint.ts (657行)、injection.ts (199行)、checkpoint-validator.ts (253行)、dream-distill.ts (200行) 等全部 15 个文件。*

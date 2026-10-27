@@ -21,6 +21,32 @@ boot 时（2_server-init.md §4）                首请求时（本篇）
 
 tag 体系（`util/src/effect/app-node.ts:1-13`）：`location: ["global"]`、`global: []`——**Location 可依赖全局，反向禁止**（编译期方向保证）。`Instance.layer` 用 `shared: Node.tags.values.global` 编译，全局节点经父 memoMap 共享（真单例），Location 节点每次构建新实例。
 
+## 0.5 什么是惰性编译（零基础铺垫）
+
+> 来源：读者与 DeepSeek 的概念问答校准后固化。已知 lazy 概念的读者可跳过本节。
+
+**惰性（lazy）= 按需触发，而不是提前全量构建**。对照两种策略：
+
+```
+饿汉式（启动即建）：
+  服务启动 → 遍历所有可能的目录 → 全部编译好 → 等请求
+  问题：目录数量未知、每份编译昂贵（读配置/spawn 插件宿主）、
+       用不到的目录纯浪费
+
+惰性编译（用时即建，本篇主角）：
+  访问目录 X
+    → LayerMap 里有 X 的图吗？
+        ├ 有：直接用（缓存命中）
+        └ 没有：现在为 X 编译一份 → 放入 LayerMap → 再用
+```
+
+两个易错点：
+
+1. **"编译"不是 Java/C++ 那种程序编译**——指解析配置、发现 agent/skill、组装服务依赖、构建图数据结构的**装配过程**（LayerNode 的 compile）。
+2. **缓存不是"固定 60 分钟过期"，现码是"永不过期"**（`idleTimeToLive: Duration.infinity`）——早期版本曾是 60 分钟空闲 TTL，后改为 infinity（取舍见 §6"为什么永不过期"）。读到旧资料说 60 分钟的，是过时事实。
+
+代价转移：把编译成本从"每次启动"变成"每个新目录的第一次请求"——这就是"服务秒起、首请求稍慢"的根源。
+
 ## 1. 触发点：LocationMiddleware
 
 **`packages/server/src/location.ts`** —— 每个带目录请求的入口流：

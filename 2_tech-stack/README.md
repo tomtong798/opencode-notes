@@ -15,7 +15,9 @@ OpenCode 不是典型 Web 应用，而是**本地优先（local-first）的 AI �
 | 文件 | 技术 | 一句话 |
 |---|---|---|
 | [1_typescript.md](2.1_client/1_typescript.md) | TypeScript | 全仓统一语言，strict 风格（禁 `any`） |
-| [2_solidjs.md](2.1_client/2_solidjs.md) | SolidJS | 细粒度响应式 UI 框架，四端共享的"组件语言" |
+| [2.0_reactivity.md](2.1_client/2.0_reactivity.md) | 响应式编程 | 概念前置：拉/推模型、四大流派、Signals 收敛 |
+| [2_solidjs.md](2.1_client/2_solidjs.md) | SolidJS | **家族主篇**：细粒度响应式 UI 框架，四端共享的"组件语言" |
+| [2.1_solidjs-reactivity.md](2.1_client/2.1_solidjs-reactivity.md) | └ SolidJS 响应式机制 | 实战：signal/store 三件套/batch/keyed（opencode 现码样例） |
 | [3_opentui.md](2.1_client/3_opentui.md) | OpenTUI | 自研终端渲染框架（含 kitty 协议、keymap） |
 | [4_vite.md](2.1_client/4_vite.md) | Vite 8 | Web/桌面端构建工具 |
 | [5_tailwind-css.md](2.1_client/5_tailwind-css.md) | Tailwind CSS 4 | 原子化样式 |
@@ -67,11 +69,13 @@ OpenCode 不是典型 Web 应用，而是**本地优先（local-first）的 AI �
 | [6_docker.md](2.4_infrastructure/6_docker.md) | Docker | 仅 CI 预烘镜像 |
 | [7_opentelemetry.md](2.4_infrastructure/7_opentelemetry.md) | OpenTelemetry | 厂商中立遥测标准 |
 | [8_honeycomb.md](2.4_infrastructure/8_honeycomb.md) | Honeycomb | 观测后端 |
+| [9_xdg-base-directory.md](2.4_infrastructure/9_xdg-base-directory.md) | XDG Base Directory | Linux 路径规范：opencode 全局路径的派生源 |
 
 ### 5. 开发与协作工具（`2.5_tooling/`）
 
 | 文件 | 技术 | 一句话 |
 |---|---|---|
+| [0.1_ts-running-guide.md](2.5_tooling/0.1_ts-running-guide.md) | └ TS 运行指南 | 零基础前置：npm/ts-node/tsx/tsc 与排错（通用知识） |
 | [1_bun-workspaces.md](2.5_tooling/1_bun-workspaces.md) | Bun workspaces | monorepo 包拓扑 |
 | [2_turborepo.md](2.5_tooling/2_turborepo.md) | Turborepo | 任务编排+缓存 |
 | [3_oxlint.md](2.5_tooling/3_oxlint.md) | oxlint | Rust 写的 linter（替代 ESLint） |

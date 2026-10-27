@@ -56,7 +56,8 @@
 | 3 | [3_model-protocol.md](3_model-protocol.md) | 模型目录 + `packages/ai` 协议层（anthropic/openai/gemini/responses） | ✅ |
 | 5 | [5_inbox-coordination.md](5_inbox-coordination.md) | 准入与协调深入（steer/queue 词汇全语义） | ✅ |
 | 6 | [6_context.md](6_context.md) | 上下文代数：system-prompt/instructions/context | ✅ |
-| 7 | [7_compaction.md](7_compaction.md) | 压缩与还原：compaction/revert/move/transfer | ✅ |
+| 7 | [7_compaction.md](7_compaction.md) | 压缩：摘要替换前缀、三路触发、预算/缩减 | ✅ |
+| 7.1 | [7.1_session-operations.md](7.1_session-operations.md) | └ 会话四操作：revert/move/transfer/diff（零耦合，语义同位合卷） | ✅ |
 | 8 | [8_agent.md](8_agent.md) | Agent 注册表/切换/权限内嵌 | ✅ |
 | 11 | [11_permission.md](11_permission.md) | 权限评估/ruleset/saved | ✅ |
 | 12 | [12_subagent.md](12_subagent.md) | 子会话派生与回收 | ✅ |
@@ -70,8 +71,11 @@
 | 13 | [13_plugin.md](13_plugin.md) | 插件宿主：同进程 hooks/四来源通道 | ✅ |
 | 14 | [14_mcp.md](14_mcp.md) | MCP 集成：连接生命周期/能力物化 | ✅ |
 | 15 | [15_location.md](15_location.md) | Location 域：五实体关系/LayerMap 缓存 | ✅ |
-| 16 | [16_pty-job.md](16_pty-job.md) | PTY 与后台作业：daemon/Job 状态机 | ✅ |
-| 17 | [17_auth.md](17_auth.md) | 认证：integration 尝试机/三 OAuth 流程 | ✅ |
+| 16 | [16_pty.md](16_pty.md) | PTY：伪终端两档（进程内/外部 daemon 找回） | ✅ |
+| 17 | [17_job.md](17_job.md) | Job 注册表：后台任务账本（身份/通知路由/恢复描述） | ✅ |
+| 18 | [18_credentials.md](18_credentials.md) | 凭证体系：存储三态/优先级/OAuth 尝试机/Copilot·Console 专层 | ✅ |
+| 18.1 | [18.1_server-access.md](18.1_server-access.md) | └ 服务访问：密码/HMAC 会话/配对码（零耦合的第三把钥匙） | ✅ |
+| 19 | [19_context-engineering.md](19_context-engineering.md) | 上下文工程：把指令/压缩/输出有界化/投递四篇串成统一视角 | ✅ |
 
 编号即推荐阅读序内的相对位置；4/5/9 等编号为固定锚点（与目录规划对齐），未写的编号不重排。
 

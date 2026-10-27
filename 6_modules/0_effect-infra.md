@@ -7,6 +7,17 @@
 
 ---
 
+## 0.5 通俗完整描述（先读这段再看细节）
+
+core 里有几十个服务（Config、Database、Tool……），它们互相依赖（Tool 要 Permission，Permission 要 Config……）。**本篇讲的是"这些服务怎么被组装起来"的自建基建**。
+
+设想用 Effect 原生 Layer 手写组装：每个服务文件结尾写一串 `layer.pipe(Layer.provide(A), Layer.provide(B))`——历史上全仓 86 处这样的"组装咒语"。四个致命问题：**看不出来谁依赖谁**（组合完是黑盒，循环依赖要到运行期才炸）；**想换一个实现要重写整条链**（测试想用假 Database？把上面全抄一遍）；**表达不了"有的服务全局一份、有的每目录一份"**；**漏写一个依赖，报错在千里之外**。
+
+opencode 的答案叫 LayerNode：**把"依赖谁"从 pipe 调用序列里捞出来，变成一个数组（deps）**——依赖信息从"埋在代码里的隐式知识"升格为"可检查、可替换、可分作用域的数据"。编译器（compile）拿着这张图：先应用替换（谁被换掉了自动改道）、查环、按作用域分治（global 节点全进程共享一份，location 节点每目录新建），最后才生成真正执行的原生 Layer。此后：加服务=声明一个 node 进数组；测试=一行 replace；宿主定制=一张替换表。
+
+一句话：**LayerNode = 服务组装的"从手工作坊到编译器"——业务代码只声明"我要什么"（deps 数组），组装的检查、替换、分域、生成全部由编译器统一完成**。
+---
+
 ## 0. 模块地图（文件清单 + 行数 + 各节归属）
 
 V2.0.30 的 Effect 基建**横跨两个包**：语言级抽象上移到了 `packages/util`，core 侧只留应用级组装与工具。
@@ -80,6 +91,38 @@ V2.0.30 的 Effect 基建**横跨两个包**：语言级抽象上移到了 `pack
      （instance/service.ts:12-15）
 ```
 
+延伸：从 Layer 到"真正跑起来"的完整生命周期（上面五段是**菜谱**，下面两段是**厨房与开火**）：
+
+```
+[构建 Runtime] makeRuntime —— util/effect/runtime.ts:5-20
+  build(layer) = ManagedRuntime.make(layer)
+      │  ★此刻才真正执行 Layer 构造器：逐节点 acquire、
+      │   填充 Context、登记 finalizer 进 Scope
+      │   （菜谱 → 一锅做好的服务实例）
+      ▼
+[点火执行] 边缘处 runXXX —— "构造/转换/执行"三分法的执行类
+  ├─ 长期驻守型入口：
+  │    server 启动 → NodeRuntime/ManagedRuntime.runFork(app)
+  │    （整个 HttpApi 服务器本身就是一个被 run 起来的 Effect）
+  ├─ 按需点火型入口（core 实测）：
+  │    Effect.runForkWith(context)（pty.ts:100、shell.ts:132、
+  │    mcp/client.ts:185——带上下文 fork 后台任务）
+  │    Effect.runPromise（与 Promise 世界交接，mcp/stdio.ts:66）
+  └─ run 后的形态 = fiber 树：
+       drain fiber（会话执行循环）
+         └ Step 流消费 fiber
+             └ 工具 fiber ×N（forkScoped，见 9_tool §3）
+       ★服务的 yield* 消费发生在这些 fiber 内：
+         每当 Effect 的 R 环境缺少服务，runtime 的 Context
+         就地供出——"定义时的依赖声明"到此兑现
+```
+
+三层各答一问：**Layer 答"要什么"**（依赖图/可替换性）；**Runtime 答"用什么"**（一次构建、Context 常驻、finalizer 归 Scope 管）；**Fiber 答"现在跑什么"**（并发单元、中断沿树传播）。`Effect.gen` 里写的服务代码从不自己找依赖——三层基建替它把 R 填满。
+
+fiber 与服务（runner）的关系——"手与工具箱"注记：fiber 是**干活的执行单元**（一次性的手：出生于 wake、跑完 drain 循环即消亡），服务如 `SessionRunnerLLM` 是**被借用的能力包**（常驻工具箱：随 location 图缓存存活，不随任何 fiber 消亡）。一次执行 = fiber 进入循环 → `instances.provide(session)` 借出该会话所在目录图 → 调 `runner.drain(...)`（手拿起工具箱），drain 内部的 promote/Step/compaction 全是 runner 预先装配好的装备（llm.ts:50-55 编译期 yield\* 齐活）。推论：① 同目录多会话的 fiber 复用**同一个** runner 实例——所以 runner 代码必须无会话状态（会话状态全在参数与 durable 表里）；② 会话迁移（Moved）时"旧 fiber 借旧 runner"组合解散、"新执行借新目录 runner"重入——fiber 可换、runner 可换，身份由 sessionID 承载。
+
+fiber 的完整生命周期（何时销毁/何时复用）：**fork →（N 轮 drain ⟲ 门铃）→ 彻底空闲 → 消亡 → 下个 prompt 重新 fork**。两个修饰：① "执行完"的准确含义是"排空**且门铃没响**"——drain 结束时 pendingWake 置位过（期间又有新输入）则不销毁，蹦床再跑一轮；② 活跃期连续来 prompt 走高频短路：fiber 还活着时 wake 只置门铃标记、不 fork 新 fiber——同一只手把新活干掉。所以"每 prompt 一个 fiber"在低频对话里近似成立，活跃对话里其实是**一批 prompt 共用一只 fiber**；只有彻底闲死过的会话，下个 prompt 才触发新的 fork（wake → Map 无条目 → start）。
+
 ## 2. LayerNode 核心（util/effect/layer-node.ts）
 
 ### 2.1 数据模型
@@ -139,6 +182,47 @@ tags(config)           :171  一次声明 tag 体系 + 受约束的 make 工厂
 ```
 
 `CompileOptions.shared` 的注释（:228）一语道破设计意图：*"Share subgraphs rooted at this tag; give the remaining wiring a fresh map for each build."*
+
+#### 2.3.1 编译的真相：三个常见误解的校准
+
+**误解一："LayerNode ≈ Go 接口"。** 不精确——Go 接口只是类型契约；LayerNode 一个值同时是三样东西：
+
+```
+Node（unbound :214）
+├─ 依赖声明位   ——"此处需要某服务"（≈ 接口值 nil 时的桩）
+├─ 类型契约     ——A（提供什么）、E（会错什么）、Tag（归属域）
+└─ 可替换性     ——replace()（:80-99）：同 Tag 才许换
+
+Provider（make :188）
+└─ 带实现的节点 ——"这个位由这个 Layer 实现，吃这些 deps"
+```
+
+更准的 Go 类比是 **`func New(db DB, cache Cache) *Service` 构造函数签名 + wire 注入器**：依赖显式声明（构造参数）、实现整体可换（换构造）。Effect 的 `Context.Service` Tag 才对应"接口"本身；LayerNode 是**把接口位、实现、依赖边打包成可组合图节点**的机制。
+
+**误解二："编译 = 对依赖数组去重"。** resolve 阶段确实有按 implementation 的查重（:276-287），但语义不是"静默去重"：
+
+- 同一 implementation + **同一套依赖** → 复用同一 Resolved 节点（图等价合并）
+- 同一 implementation + **不同依赖** → **直接抛错**（"wired to different dependencies; use a distinct implementation Layer"）——因为同一 Layer 对象被两处以不同依赖装配，运行期哪个生效取决于装配顺序，编译器拒绝这种歧义
+
+**误解三："编译把 instance 级依赖替换成 global 级"。** 方向反了。看 instance.ts:155-161 的替换现场：
+
+```
+replacements = [
+  vanilla 默认替换,                       ← 优先级最低
+  ...options.replacements,                ← 调用方覆盖默认
+  Location.node.replace(boundNode(ref)),            ←★ per-目录节点绑定具体目录
+  InstancePlugins.node.replace(bound(plugins)),
+]
+shared: Node.tags.values.global
+```
+
+真相是**编译把同一个全局图模板"按目录实例化"**：
+
+- `shared:"global"` 让 global 标签的子树（Config/Database 等进程级服务）跨所有 Location **共享同一份**（阶段二用外层 memoMap，不重复构建）
+- Location/InstancePlugins 这类 per-directory 节点靠 replace **重绑定到具体目录**（每次 compile 新 memoMap）
+
+一句话：**全局服务共享、局部服务重绑——"一处模板，多目录实例化，全局部分不重建"**，而不是"instance 依赖被替换为 global 依赖"。
+
 
 ## 3. app-node：双作用域 tag 体系（util/effect/app-node.ts）
 

@@ -7,6 +7,17 @@
 
 ---
 
+## 0.5 通俗完整描述（先读这段再看细节）
+
+**插件 = 外部代码注入干预点**：宿主在执行流的关键位置埋了 18 个钩子（提交前/工具执行前后/权限评估时…），插件注册到这些钩子上就能观察或改变行为——比如"每次工具执行前记个账"、"改写提交内容"。
+
+三个澄清直觉的要点：①**插件是同进程的**——不是独立进程沙箱，它跑在你的进程里直接调宿主服务（所以能力巨大、信任要求也高；加载器会拦截插件自带重复依赖保证 Effect 单副本）；②**内部功能也是插件**——15 个内置工具、7 个 agent 全部以普通插件身份注册（无特权通道），"配置插件"读你的 opencode.json 把自定义内容灌进注册表——**插件系统是 opencode 的扩展底座而不只是外挂接口**；③**干预点有类型纪律**——18 个钩子只有"工具执行前"允许失败拦截（拒绝这次调用），其余只能观察或转换，失败通道在类型层锁死。
+
+生命周期：宿主装配时从四来源（内置/npm 包/本地目录/配置声明）解析模块 → 生成代次（generation）→ 订阅配置变更热重载。插件 API 的门面（ctx）提供 tool/agent/skill/command 的 transform 编辑器——注册即编辑注册表。
+
+一句话：**同进程钩子宿主+注册表编辑器——18 个埋点观察/改变执行流，内部外部同一通道，扩展即插件**。
+---
+
 ## 0. 模块地图
 
 两个包分工：`packages/plugin` 是**插件 SDK**（插件作者 import 的 API 面 + 宿主侧装载器，发布为 npm 包 `@opencode/plugin`）；`packages/core/src/plugin/` 是**宿主装配**（把 SDK 的装载器接到 config/npm/watcher/registry 上）。
@@ -115,6 +126,8 @@ packages/core/src/plugin/           ★ 宿主侧（23 文件，3,375 行中约 
 
 注册 API 返回 `Registration{dispose}`（`registration.ts:5-7`），dispose 从回调表移除（`hooks.ts:76-83`），scope finalizer 兜底。
 
+**hook vs event.subscribe 的职责分界**（插件的两条消费通道，容易混淆）：hook 是"**改**"的通道——同步、在执行路径上、入参即该位置流动对象的 DeepMutable 版本（改完回到执行流）；`ctx.event.subscribe()` 是"**看**"的通道——异步旁观 Bus 全量事件流（如 `session.text.delta` 逐 token、`inbox.enqueued` 提交后），不在执行路径上、不能改任何东西，想反应就自己调 ctx 的动作 API。选择标准一句话：**要在事前/事后改变行为用 hook，要全程观察用 event**。
+
 ## 3. 宿主装配
 
 ### 3.1 插件从哪来（四个来源通道）
@@ -200,6 +213,8 @@ ctx
 │   generate.text / credential.activate / experimental.terminal.read
 └─ rpc                             宿主 RPC client + register（host.ts:119）
 ```
+
+**rpc.register 的能力面**（§4 图里一行带过，这里说清能干什么）：插件不止消费——还能**定义自己的 RPC 端点并 emit 自定义事件**（`effect/rpc.ts` 的 RpcDomain.register + RpcRegistration.events.emit）。这打开两个方向：**前端可调用插件**（自定义端点进协议面，客户端像调内置 API 一样调它）；**插件间通信**（A 插件 emit 的事件 B 插件经 event.subscribe 收到——rpc.* 前缀正是为此保留的命名空间，:198 行"过滤为 ServerEvent | rpc.*"的后半段）。这也是 §1 说"rpc entrypoint"存在的意义：需要暴露 RPC 的插件走第三入口。
 
 两个版本：Effect 版（`effect/plugin.ts` define，回调返回 Effect）与 Promise 版（`src/README.md`："the async/await equivalent"，setup 可返回 cleanup 函数，`promise/adapter.ts` 桥接）。AGENTS.md 约束：每个 domain 必须扩展 `@opencode/client/effect/api` 的对应 client 接口，只增量添加插件语境函数——保证 ctx API 与官方 client API 形状一致。
 

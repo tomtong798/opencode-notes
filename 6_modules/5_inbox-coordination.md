@@ -47,6 +47,23 @@ packages/core/src/session/
 └─ schema/src/session-inbox.ts（78 行）Delivery 字面量 + Item tagged union
 ```
 
+## 0.5 通俗完整描述（先读这段再看细节）
+
+用户发来的每条消息（或 hook、通知）不是立刻喂给模型，而是先成为 inbox 表里的一行"待办"。**本篇讲的就是这份待办的两个管理者**：
+
+**第一个管理者：inbox（投递状态机）**。它是一张数据库表，每行待办带着投递方式：`steer`（插话——"现在正在跑的这轮请捎上我"，赶上批的提升会一起给模型）或 `queue`（排队——"等模型闲下来再轮到我"，空闲边界一次只放行一个）。还有两种特殊的"控制项"（手动压缩、会话迁移）——它们不是消息，而是"改写历史"的指令，是投递的**硬边界**（steer 批提升到这里必须停刀，边界后的话属于改写后的历史）。待办可以被取消、可以从 queue 改 steer（编辑体验的基础）。
+
+**第二个管理者：coordinator（门铃执行器）**。输入入库后按一下门铃（wake）——如果这个会话已经有执行在跑，只留一个"再跑一轮"的标记（十次按铃折叠成一次）；没有就雇一个临时工（fork 该会话专属 fiber），工人在"排空循环"里反复取活：提升待办→调模型→跑工具→直到没活干；干完且门铃没再响，工人解散（下次 prompt 再雇新的）。开工前工人会在数据库写一张"我正在跑"的条子（write-ahead claim）——进程若崩了，下次启动扫到残留条子就知道哪些活干到一半，接着续跑。
+
+两个容易理解偏差的关键点：
+
+1. **没有常驻消费者**——不存在一个后台线程持续扫表；一切由 wake 点火：fork→干→散。同会话串行（防撕裂数据）、跨会话并行是 coordinator 的两条铁律。
+2. **"为什么叫协调"**——它不执行任何业务，只管"谁在跑、跑几份、崩了怎么认领"的所有权；真正干活的能力（runner）在会话所在目录的图里，工人按需借用（fiber 是手、runner 是工具箱）。
+
+一句话：**inbox 管"活什么时候进窗口"（steer/queue/控制项），coordinator 管"谁在干这个活"（门铃合并、临时工、claim 遗嘱）——两张账合起来，就是"输入永不丢、执行不打架、崩溃可续跑"**。
+
+---
+
 ## 1. 心智模型
 
 两个组件回答两个正交的问题：
@@ -155,6 +172,25 @@ return promoted + (yield* publish(db, bus, sessionID,
 ### 2.3 控制项作为投递边界
 
 spec L23：*"Manual compaction and Session movement use the same inbox as control items. Each request has its own inbox identity and delivery mode. A control item forms a delivery boundary so later steers do not cross it."*
+
+**"硬边界"的语境解释（为什么不能跨）**：压缩/迁移是要**改写对话历史本身**的操作（压缩折叠前缀成摘要、迁移换执行环境）。想象边界后的 steer 混进边界前的批次：
+
+```
+steers = [steer1, steer2, 压缩控制项, steer3]
+                      ↑
+promote 批提升：findIndex 找到首个控制项
+→ 只提 [steer1, steer2]（slice(0, control)），steer3 不跨
+
+如果不停刀：steer3（压缩之后用户才说的话）
+混进压缩前的历史位置——它属于"压缩后语境"，
+落进"压缩前版本"的历史 = 歧义
+```
+
+规则的效果：压缩前的话进压缩前的最后一轮上下文；压缩自己执行、历史改写；steer3 留在 inbox，等下一轮 promote 进入压缩后的新历史——**每句话都落在它该属于的历史版本里**。
+
+配套的两刀（promote 现场，inbox.ts:507-531）：`control === 0`（控制项就在队首）→ promote 返回 `undefined`，这一轮不提任何消息，把边界让给 runner 先处理控制项；queue 分支放行一个 queue 项前同样检查——是控制项也交给 runner 直接处理（:527）。
+
+其余边界性质：
 
 - 控制项与普通项同表同行（同 `session_inbox` 表、同 `Delivery` 字面量），只是 `type` 不同；投递时"行删除但不成为消息"——projector 对 compaction/move 直接 `return`，不插 transcript（projector.ts L628-629）。
 - **admitCompaction 的特化冲突规则**（inbox.ts L204-228，`serialized` 锁内四步）：精确命中同会话 compaction → 返回它（幂等）；同 ID 已是别的东西/已 promoted → `LifecycleConflict`；**已有任一 pending compaction → 返回那个**（一会话至多一个待处理 compaction）；否则 admit。这是 spec L9 "operation-specific conflict behavior" 的 compaction 落点。

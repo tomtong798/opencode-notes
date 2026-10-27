@@ -43,6 +43,23 @@ packages/core/src/
 
 角色一句话：**schema 定义形状，discovery 找文件，normalize 收敛形状，config.ts 门面持有快照并广播变更，config/plugin/* 把配置灌进各领域注册表，v1/config 只剩"旧形状的解码器 + 迁移函数"**。AGENTS.md 风格约束：config 模块顶部统一 `export * as ConfigXxx from "./xxx.js"` 自导出。
 
+## 0.5 通俗完整描述（先读这段再看细节）
+
+配置文件的**位置在代码中是可获取的**——项目侧由 `fs.up()` 从当前目录向上回走，每层探测 `opencode.json(c)` 散落文件与 `.opencode/`、`.claude/`、`.agents/` 目录（discovery.ts:85，近者优先）；全局侧有固定根：`~/.config/opencode/`、wellknown 集成清单、`--file` 显式指定、`OPENCODE_CONFIG_CONTENT` 内联、系统托管目录（/etc/opencode、macOS MDM plist）。
+
+应用**启动时 watch 对应的目录和文件**（watch 计划覆盖配置根 + 各散文件的父目录，删除重建仍可见，watch.ts:33-36）。发现配置源后**逐个文件走五步加载管线**（config.ts:142-149）：读取 → `{env:VAR}`/`{file:path}` 变量替换 → JSONC 解析（容尾逗号）→ **归一化**（V1 形状就地迁移 + 文档内浅合并，无跨文档深合并）→ Schema 校验（失败整文档丢弃）。每个文件解析为一个 **Document**，加上各配置目录的 Directory 占位，**按优先级低到高排入 Entry[] 数组**（config.ts:281-290）。
+
+四个容易理解偏差的关键点（初学者高频误读，先校准）：
+
+1. **没有"合并后的最终生效配置"**——数组永远停留在 Entry[] 形态，优先级仲裁**推迟到每次消费时**：标量用 `Config.latest()`（findLast 末位定义者），map 型由配置插件按序遍历逐个 upsert。不同层有不同仲裁规则（managedPolicies 垫底反转等），单一合并算法表达不了。
+2. **"每个 Location 一份"，不是进程一份也不是共享一份**——Config.node 是 `makeLocationNode`（config.ts:421）：每个打开的目录编译自己的图时各建一个 Config 实例，各持各的 Entry[] 闭包变量（**同目录内共享这一个引用，跨目录各持**）。跨 Location 共享的只是"发现原材料"（Global 路径/Credential/WellKnown 这些 global 级 deps 单例），不是配置结果。每目录一份是因为 direct/project 层的发现起点就是该目录自己的祖先链——两个目录的 Entry[] 内容本就不同；代价是全局层文件被各份重复解析（轻量），换配置隔离。
+3. **变更重载有三道阀门**——PubSub(sliding 1 突发合并) → debounce 100ms → reload 信号量串行；reload 后**深比较，无变化静默返回**，有变化才整体替换 `configs = next` + 广播 `config.updated`。另有三个非 fs 触发源：凭据切换、wellknown 更新、10 分钟定时刷新。
+4. **消费者用的不是启动快照，是活数据**——`entries()` 实时读取当前数组；消费姿势两种：按需现查（每次 latest 拿最新），或订阅 config.updated 收到后重读再应用（EntryObserver 型插件）。真正的快照语义只在测试层（testLayer 的 setEntries）。**配置是活数据流，不是启动定格。**
+
+全流程总览图见 §2.0；下文各节展开细节。
+
+---
+
 ## 1. 心智模型
 
 **没有"合并后的大配置对象"。** 每个配置文件解析成一个 `Document`（`schema/config.ts:121-125`：`{type:"document", path?, info}`），每个配置目录产生一个 `Directory` 占位（`:127-130`），全部按**优先级从低到高**排成 `Entry[]`。优先级仲裁推迟到消费侧：标量字段用 `Config.latest()`（`core/config.ts:24-27`，`findLast` 找最后一个定义该字段的 document——数组末尾即最高优先级）；map 型字段（agents/mcp servers/commands）由各插件按序遍历全部 document 逐个 upsert。
@@ -87,6 +104,59 @@ managedSettings          # 系统目录(/etc/opencode 等) + macOS MDM plist，�
 ```
 
 ## 2. 配置 Schema 速览
+
+### 2.0 端到端全流程图（发现 → 归一化 → 应用 → 热重载闭环）
+
+一张图串起本篇全部小节（§1 分层 → §3 管线 → §5 消费 → §4 重载）：
+
+```
+【发现 discover（discovery.ts，§1）】
+ cwd ──fs.up() 向上回走──→ 根
+   每层探测：opencode.json(c)→direct ｜ .opencode/→project
+   （全局根剔除，防回灌 discovery.ts:102-107）
+ 外部来源：managedPolicies/wellknown/globalSupplementary/
+           explicit(--file)/content(env 内联)/managedSettings
+        │
+        ▼ 按"低→高"拼成加载清单（config.ts:281-290，§1 优先级条）
+─────────────────────────────────────────────────────────
+【加载 load（§3 五步/文件，config.ts:142-149）】
+ 读文件 → {env:VAR}/{file:path} 变量替换（variable.ts）
+ → JSONC 解析（容尾逗号）→ ★归一化 normalize（§6）
+   ├ V1 形状就地迁移（permission 动作改名/agent 拆解/
+   │ MCP 三段超时…）
+   ├ 文档内 legacy/native 浅合并（mergeMaps/prefer）
+   └ 产出 diagnostics（冲突/unsupported 不致命）
+ → Schema 校验（失败→整文档丢弃，§9）
+        │  每个文件 = 一个 Document；每个目录 = 一个 Directory 占位
+        ▼
+【Entry[]（真相形态：没有"合并后大对象"，§1）】
+ 低 → 高：[managedPolicies, wellknown, global, explicit,
+           direct(近者高), project, content, managedSettings]
+        │
+        ▼ Config.Service（每 Location 一份，§4）
+─────────────────────────────────────────────────────────
+【应用：消费侧仲裁（§5 三类插件，16 个）】
+ 标量/map：Config.latest() —— findLast 取末位定义者
+   └ A. EntryObserver 型（shell/snapshot/tool-output…）
+ map 语义：按序遍历全部 Document 逐个 upsert（后写胜）
+   ├ B. 自管 watcher 型（agent/command/instruction/
+   │   compatibility——双源：配置键+目录 .md 文件）
+   └ C. 注册表翻译型（provider/mcp/policy/skill）
+ 汇入各域注册表 → 经 internal.ts:252-268 的 post 组排序，
+ 配置插件最后跑（后写者胜，可覆写内置默认）
+─────────────────────────────────────────────────────────
+【热重载闭环（§4）】
+ fs 变更 → Watcher（目录+父目录兜底）→ PubSub(sliding 1)
+ → debounce 100ms → reload()（信号量串行）：
+   discover→load→normalize→深比较
+   ├ 无变化：静默
+   └ 有变化：替换 configs + Bus 发布 config.updated
+        ├ PluginSupervisor 重装插件（supervisor.ts:226）
+        └ EntryObserver 型插件内部刷新
+ 另三个触发源：凭据切换 / wellknown 更新 / 10min 定时刷新
+```
+
+### 2.1 字段速览
 
 `Config.Info`（`schema/config.ts:26-114`）顶层字段（全部 optional，蛇形命名）：
 

@@ -1,10 +1,42 @@
-# 压缩与还原详解（摘要替换前缀历史以释放上下文窗口 + revert/move/transfer/diff 四个会话级操作）
+# 压缩详解（摘要替换前缀历史以释放上下文窗口）
 
-> 一句话：**压缩 = 用一份结构化摘要（checkpoint）替换前缀历史，把模型可见窗口从"全量 transcript"切换到"摘要 + 保留的近期消息"；本篇下钻 compaction.ts 的三路触发、预算/缩减算法、原生 provider 窗口，以及同一目录下 revert / move / transfer / diff 四个操作模块。**
+> 一句话：**压缩 = 用一份结构化摘要（checkpoint）替换前缀历史，把模型可见窗口从"全量 transcript"切换到"摘要 + 保留的近期消息"；本篇下钻 compaction.ts 的三路触发、预算/缩减算法、原生 provider 窗口。**
 > 代码基线：v2.0.30，dev 分支（e25b7abf89）；行号实测（2026-10-19）。
 > 权威出处：`specs/v2/session.md`（"Compaction Rebuilds Active History" L98-104、投递词汇 L14-23、指令 epoch L96）+ 仓库根 `AGENTS.md`（Session Core 节）。
 > [返回 README](README.md) | 前置 [4_session.md](4_session.md) §7（触发面总表，本篇不重复） | 控制项投递语义见规划中的 5_inbox-coordination.md（本篇只引用）
 
+---
+
+## 0.5 通俗完整描述（先读这段再看细节）
+
+对话越长，窗口越满——满了之后模型既装不进新内容、注意力和缓存也在退化。**压缩就是把前面的历史折叠成一份摘要**，让对话"带着总结继续"：摘要替换旧前缀，最近的对话保留原文，模型从摘要处接着干。（revert/move/transfer/diff 四个会话操作已拆至 [7.1_session-operations.md](7.1_session-operations.md)——它们与压缩零代码耦合，2026-10 拆分归位）
+
+三种触发方式：用户手动 `/compact`；自动——用量逼近阈值时在安全边界顺手压缩（阈值=窗口减去预留）；被动——模型请求超长被 provider 拒了，现场压缩重建同一步再试。压缩本身也是一次 LLM 调用（专门的角色、专门的 prompt："把以上对话总结为……"），输出流式实时可见（你看到的"压缩中"进度）。
+
+两个精妙处：①**压缩是投递硬边界**——它以控制项身份进 inbox 队列，批提升到它必须停刀（压缩后说的话属于新历史，不能混进旧前缀的批次）；②**压缩推进指令纪元**——压缩后指令基线重新快照，旧的"环境变更公告"折叠进摘要，模型的世界观被整理归零。失败的压缩零副作用（历史未动，标记失败即止）；崩溃时进行到一半的压缩在重启时被判失败收场。
+
+顺带澄清两个易混操作：**revert**（还原到某条消息——物理回退历史，暂存/确认两阶段）；**move**（会话搬家换目录——执行环境切换）。它们与压缩同住一个文件族但语义各异。
+
+**"前缀"的精确语义**：前缀 = 消息序列（按 seq 单调编号）的早期部分——即口语的"历史对话前半段"。但"摘要替换前缀"**不是删除**：完整 transcript 永远 durable 存在（spec 原话 "The full transcript remains durable"），压缩改变的只是**模型可见历史的读取起点**——history.ts:83-91 加载时 `WHERE seq >= 压缩点seq`，被跳过的那一段就是"前缀"；压缩点本身展开成 `<conversation-checkpoint>`（摘要+近期上下文）。用"前缀"这个词还承接了**前缀缓存**的术语：请求前缀与上次一致才命中缓存（1/10 价），"保留近期、折叠早期"正是为了前缀稳定——与指令基线（6_context）"稳定在前、变化在后"同一逻辑。
+
+```
+压缩前（模型看到的窗口）                压缩后（模型看到的窗口）
+┌────────────────────────────┐      ┌────────────────────────────┐
+│ seq1 用户A                  │      │ <conversation-checkpoint>  │
+│ seq2 模型a                  │      │   <summary> 把 seq1-5 的    │
+│ seq3 工具t   ← 早期消息      │ 折叠 │   要点总结成一份摘要         │
+│ seq4 模型b     （前缀）      │ ───► │   <recent-context> …</>    │
+│ seq5 用户B                  │      ├────────────────────────────┤
+├────────────────────────────┤      │ seq6 模型c   ← 近期消息      │
+│ seq6 模型c   ← 近期保留      │ 保留 │ seq7 用户C     原样保留      │
+│ seq7 用户C                  │      │ seq8 模型d                  │
+│ seq8 模型d                  │      │        （下次读取起点=压缩点）│
+└────────────────────────────┘      └────────────────────────────┘
+       完整 seq1-8 永远在数据库（UI 可回放全部历史）——
+       变的只是"模型从哪读起"（读取起点平移到压缩点）
+```
+
+一句话：**窗口治理=摘要替换前缀；三种触发、控制项身份、纪元推进——"让长对话可持续"的核心机制**。
 ---
 
 ## 0. 模块地图
@@ -40,9 +72,6 @@ packages/core/src/session/
 │       ├─ recentUserMessages(860) 原生路径保留的整条用户消息
 │       ├─ estimateContext(874) / estimatePrompt(880) 上下文估算
 │       └─ calculateCeiling(911) / fitOutput(939) / estimate*(950-988)
-├─ revert.ts    ★ 三阶段还原（114 行）：stage(21) / clear(59) / commit(76) / plan(84)
-├─ move.ts      ★ 会话换目录（179 行）：三种 DestinationError(25-38)
-│               resolveDestination(74) / sourceUnavailable(104) / move(119)
 ├─ transfer.ts  ★ 会话导出/导入（339 行）：export(57) / import(64)
 │               isSettled(165) / sanitize(180) / sanitizeMessage(208-310)
 └─ diff.ts      ★ turn 级文件 diff（138 行）：TurnRangeError(15) / turn(38-137)
@@ -91,6 +120,8 @@ auto 压缩触发（估算 ≥ ceiling）：
   [C1'=compaction(providerContext=加密窗口)]    [sys][窗口内消息(U U)][新消息…]
                                               provider 决定保留什么；本地不可读
 ```
+
+**图例（上图的缩写）**：`U/A` = User/Assistant 消息；`[sys]` = system 段（模板+工具指导）；`C1/C2` = 第 1/2 次 compaction 的 durable 消息；`S1/S2` = **Summary**（摘要——summarize 的产物，第 1/2 版）；`E4/E5/E6` = **Entries/epoch 基线**（[6_context.md](6_context.md) §5 的指令快照——压缩推进纪元后基线重新渲染，编号即 epoch 版本号）。两个易读错点：① **指令不在 checkpoint 里**——checkpoint 展开 only `<summary>+<recent-context>`（to-llm-message.ts:316-321 实测），指令基线在 system[1] 段；`E4` 标在 checkpoint 旁表达的是"压缩点之后模型的环境认知 = 新基线 E4"——S1 管"聊过什么"、E4 管"环境是什么"，合起来是压缩后世界观的两半。② `S2 覆盖 S1+E4+E5（非增量拼接）`——第二次压缩用 update 模式的 prompt **重新总结**（上次的摘要+后续对话再压一遍），不是把 S1 原文拼进 S2——防"摘要的摘要"层层失真。
 
 还原（revert）则是**回退到某消息**：durable 层删除边界之后的所有消息行（projector.ts:759-775），并把边界之后 assistant 触碰过的文件从快照恢复。两者都是"重写模型可见历史"的操作，但方向相反：压缩是无损摘要（transcript 保留），revert 是真删。
 
@@ -267,119 +298,10 @@ SessionHistory.preview  同上                 手动压缩前组装上下文（
 
 ---
 
-## 5. Revert 三阶段
-
-revert.ts 共 114 行，三个操作 + 一个 plan。状态存在 `Session.Info.revert`（messageID + 原始快照 ID + 文件 patch 列表），由 Staged/Cleared 投影写入 SessionTable（projector.ts:737-757）。
-
-```
-stage（21-57）                        clear（59-74）         commit（76-82）
-─────────────────────────────         ──────────────         ──────────────
-1 复用或捕获原始快照(:32-34)           把 staged files        只发布 Committed；
-2 plan(:84-114)：扫边界之后            还原回原始快照          重活全在投影：
-   所有 assistant 的                    (:66-69)              projector.ts:759-775
-   snapshot.start,得 文件→              发布 Cleared           ├ 删 seq≥边界 的全部消息
-   该文件最后快照 的映射                    （投影清 revert）      ├ 清 inbox 残留
-3 立即物理 restore(:40-41)                                  └ 重置指令状态
-4 diff 出 patch 列表(:43-45)
-5 发布 Staged(写 session.revert)
-```
-
-关键细节：**stage 就已经动了工作区文件**（不是 commit 才动）；`files:false` 只暂存消息不动文件（:40-42）。commit 本身只发事件（:76-82）——事件溯源风格，截断逻辑在投影。三处自动 commit：新 prompt 准入时（session/session.ts:164-165）、手动 compact 前（:251）、`Session.prompt` 内（:310 条件）。stage/clear/commit 三个入口在 session/session.ts:319-345 都先查 `execution.isActive` → BusyError（stage :322-323）。
-
-### 5.1 时序与状态机
-
-```
-                ┌─ Session.revert.stage(msgID)（需 idle）
-                │   捕获快照 + 物理还原文件 + 写 session.revert
-                ▼
-          [staged] ──clear──> [干净]（文件还原回原始态，revert 字段清空）
-                │ │
-                │ └─ 新 prompt 准入 / Session.compact / Session.prompt
-                │    → 自动 commit（session/session.ts:164,251,310）
-                ▼
-              commit → 删 seq≥边界 消息 + 清 inbox + 重置指令状态
-                       （projector.ts:759 起；边界行不存在 → die，:769-770）
-```
-
-`plan`（revert.ts:84-114）的取件规则：边界之后每条 assistant 若带 `snapshot.start`，其 `snapshot.files` 里每个文件映射到**该 assistant 的 start 快照**；后写的覆盖先写的（`!files.has(file)` :110-111）——即"每个文件回到它最后一次被触碰之前的状态"。边界消息本身不存在 → `MessageNotFoundError`（:91）。
 
 ---
 
-## 6. Move
-
-move.ts（179 行）：会话换 Location（目录）。`move`（:119-158）：
-
-1. `resolveDestination`（:74-102）：`~` 展开（:79-80）→ 绝对路径 → stat 校验（不存在/非目录 → 前两种错误 :25-33）→ `projects.resolve` 得 projectID/subpath → **探测目标 Location 服务可用性**（:91-100，不可用 → `DestinationUnavailableError`）。探测放 inbox 锁外（:122 注释：初始化期间仍可取消）。
-2. `sourceUnavailable`（:104-116）：源目录失联判定（会话不活跃 + 源目录不在 + Runner 层也起不来）。
-3. `serialized` 锁内二选一（:129-156）：**紧急路径**——源失联且位置未变且不活跃 → 取消全部待决 move 项 + 直接发布 `Moved`（:140-147，恢复"探测时的放置"）；正常路径 → 以新 inbox ID admit **move 控制项**（delivery 默认 steer，:124-128）→ `execution.wake`（:157）。
-
-runner 侧（runner/llm.ts:96-105）：安全边界取到 move 控制项 → **先 `modelTransport.close(sessionID)`**（关闭模型传输连接）→ 原子发布 `InboxDelivered + Moved` → drain 返回 `DrainResult.Moved({continuation})`。execution.ts:107 的 `Moved: (result) => drain(sessionID, false, result.continuation, promotable)` 在**新 Location** 上重新进入 drain——continuation 保 step 计数。Moved 投影更新 SessionTable 的 directory/path/project_id/workspace_id（projector.ts:475-493）。与 inbox 的呼应：move 与 compaction 同为控制项、同为 delivery boundary、promote 里 `control === 0` 时 move 挡住一切（inbox.ts:505-509）。
-
-### 6.1 Moved 三态呼应与 drain 循环
-
-```
-SessionMove.move（正常路径）                    runner drain（llm.ts）
-──────────────────────────                    ─────────────────────────
-admit move 控制项 → wake ──────────────────▶  nextPromotable 取到 move
-                                               ├ modelTransport.close(sessionID)（:99）
-                                               ├ 原子发布 [InboxDelivered + Moved]（:100-104）
-                                               └ return DrainResult.Moved({continuation})
-                                                     │
-execution.ts:107 ◀──────────────────────────────┘
-  Moved: (result) => drain(sessionID, false, result.continuation, promotable)
-  → 在新 Location 重新 drain（continuation 保 step 号；非 continuing 则 step=1, :109-112）
-
-drain 顶层相邻语义：
-  入口（:64-68）：非 force 取 nextPromotable，move/compaction 属 control 可越过 queue 闸
-  lifecycle.isClosed（:78-81）：Location 已关 → 关 transport → DrainResult.Reloaded
-```
-
-`sourceUnavailable` 的紧急路径是唯一的"不走 inbox 的 move"：源目录已经没了，排队等边界毫无意义，直接发布 Moved 改写 SessionTable（projector.ts:475-493）。
-
-### 6.2 move 与 compaction 的对称性
-
-两者是仅有的两类控制项（inbox.ts:507 的 findIndex 只查这两种）：同样的 delivery boundary、同样不产生 transcript 消息（inbox 投影 :624 一并跳过）、同样由 runner 在安全边界原子消费。差异：compaction 重组历史后 `continue` 本地循环（llm.ts:161-162），move 则**终止本地 drain** 交还 execution 换 Location。
-
----
-
-## 7. Transfer
-
-transfer.ts（339 行）语义实测：**不是父会话转手，是会话的导出/导入（跨实例搬运）**。父会话（parentID）只在 import 时校验存在（:73 `sessions.get(parentID)`），不存在转手语义。
-
-- `export`（:57-63）：info + `isSettled` 过滤后的消息（:165-169：未完成的 assistant、running 的 shell/compaction 都不导出）。`sanitize` 模式（:180-339）把所有文本/路径/元数据替换为 `[redacted:kind:id]` 占位——用于 bug 报告。压缩消息的 sanitize 特别处理 providerState 保留结构、providerContext 直接抹掉（:301-305）。
-- `import`（:64-154）：sessionID 冲突 → `ImportConflictError`（:72；投影侧 `SessionAlreadyProjected` defect 也转成它，:147-151）。**导入也走事件通道**：复用 `SessionEvent.Created` + 自定义 `commit` 钩子（:110-143）在同一事务内插消息行、`Bus.reserveSequence`、回填 cost/tokens/各时间戳——投影零特例（durable events minimal 原则的又一体现）。
-
-### 7.1 导入事务的事件溯源细节
-
-```
-SessionEvent.Created（payload 带全部 info 字段）
-  └ commit(seq) 钩子（transfer.ts:110-143）在投影事务内：
-      ├ db.insert(SessionMessageTable).values(messages)（:113）
-      │    seq = index+1 重排（:84）——导入的历史是压缩过的；
-      │    失败的压缩/未完成 assistant 已被 isSettled 过滤（:77）
-      ├ Bus.reserveSequence(db, sessionID, seq + messages.length)（:114）
-      │    预留 seq 空间，后续新事件接在导入历史之后
-      └ UPDATE SessionTable 回填 cost/tokens/时间戳/idle_outcome（:116-142）
-```
-
-sanitize 不导出 providerContext（:301-305）意味着**导入的会话丢失原生窗口**——但本地摘要（text/recent）保留，所以文本压缩跨实例可迁移，原生压缩只能在制造它的 endpoint 上重放（与 §4 的 Boundary 语义自洽：跨了 provenance 自然读不到，历史里还有它代表的原始消息可走 "local" 重新压缩）。
-
----
-
-## 8. Diff 的角色
-
-diff.ts（138 行）与压缩/还原**无关**：它 diff 的是**一个 turn 内工作区文件的变化**（turn = 从上次 idle 标记后的第一条 prompt 到下一个 idle 标记，头部注释 :23-37）。`turn`（:38-137）：
-
-- anchor 默认最后一条 user 消息（:76）；`from/to` 可扩展范围（非 user 消息 / to 早于 from → `TurnRangeError` :15-19）。
-- 无 idle 标记的老会话按"prompt 到下一 prompt"退化（:81-85 legacy）。
-- 取范围内 assistant 步骤的首个 `snapshot.start` 与末个 `snapshot.end` 做 `snapshot.diff`（:126-136）；只有活跃会话中仍在跑的步骤才对比工作区现场（:129-130 `running`）。
-- 跨 location switch 的范围拒绝 diff（快照树留在捕获它的 Location 仓库里，:121-122）。
-
-它是 Session 门面 `diff` 操作的底层（session.ts 门面的 log/diff 在 4_session.md §0），语义上属于"读路径"，放在 session/ 下只因操作以会话为界。
-
----
-
-## 9. 不变量与设计取舍
+## 5. 不变量与设计取舍
 
 1. **压缩是控制项而非普通消息**：`/compact` 经 inbox 控制项投递（spec L23），投递即 `InboxDelivered` 消费 inbox 行但**不产生 transcript 消息**（spec L7 "consumed without becoming transcript messages"；inbox.ts:624 投影跳过）。为什么：压缩要在"安全边界 + 无人插队"下重组历史，若作为普通 prompt，后续 steers 可能落进即将被摘要掉的前缀；控制项的 delivery boundary 语义（inbox.ts:507 findIndex）保证边界干净。
 2. **摘要是 durable 事件**：`Compaction.Ended` 是 durable 事件（session-event.ts:609），投影落成 completed compaction 消息行——它既是模型上下文的一部分（checkpoint 展开），又是历史加载边界（history.ts:90），又推进指令 epoch（projector.ts:733）。Delta 则是 ephemeral（:601）——流式过程不进 replay（spec L110）。
@@ -391,7 +313,7 @@ diff.ts（138 行）与压缩/还原**无关**：它 diff 的是**一个 turn �
 
 ---
 
-## 10. 失败与恢复
+## 6. 失败与恢复
 
 - **压缩中断（aborted）**：manual 压缩被 interrupt → `onInterrupt` 刻意不发事件（compaction.ts:672-675，runner 拥有该消息的生命周期）；runner 侧捕到 `Cause.hasInterruptsOnly` → 发 `Compaction.Failed(error={type:"aborted"})`（llm.ts:150-158）。auto/overflow 中断则由 onInterrupt 直接发 `compaction.interrupted`（:673-675）。
 - **崩溃恢复 `settleStaleCompactions`**（runner/llm.ts:332-360，注意：在 `session/runner/llm.ts` 而非 `llm.ts`）：进程死亡跳过了压缩的 finalizer，留下 `status='running'` 的孤儿 compaction 行。每次 drain 入口（:71）扫描它们，**从最新往最旧**（匹配事件投影顺序）逐个发 `Compaction.Failed(compaction.interrupted)`——message-updater 把 running 转 failed（:465-484）。注释（:335-336）点名"包括藏在已完成检查点后面的孤儿"。
@@ -405,13 +327,13 @@ diff.ts（138 行）与压缩/还原**无关**：它 diff 的是**一个 turn �
 
 - **旧笔记 4.3 §9 的 `compactIfNeeded` / `compactAfterOverflow` 已不存在**（全仓 grep 零命中）。现结构是单一 `compact(trigger)` 入口 + reason 判定：`compactIfNeeded` 的职责化为 `due()`（compaction.ts:242-251）+ runner 每 Step 的无差别调用（llm.ts:220，由 compact 内部自判 skipped）；`compactAfterOverflow` 化为 step.ts:158-166 的 `recoverOverflow` 回调 + llm.ts:320-323 的一次性闸门。旧笔记时代的 compaction 约 241 行，现 988 行：新增了原生 provider 窗口（compactNatively + providerContext/provenance 体系）、SHRINK_STEPS 预算循环、flattenAndDropOldest 拍平、update/legacy 双态摘要 prompt、fitOutput、估算锚点（estimatePrompt 的 measured/estimated 双轨）。
 - **compaction.ts 里的 "todo"**：:74 与 :76 是两处普通代码注释（`// todo: this should become a msg reference, we shouldnt be stringifying the recent history`、`// todo: consolidate these 2`），与已死的 Todo 功能（旧笔记 4.14）**毫无关系**——只是作者承认两个技术债：① recent 历史被 stringify 成文本而非消息引用（注释自注"confuses some models"）；② providerState/providerContext 两个出口待合并。类似的还有 :480 的 `TODO: Read the previous summary from the hooked request`。
-- **4_session.md §7 的 revert 描述**已覆盖 stage/clear/commit 面（本篇 §5 下钻 plan/自动 commit/BusyError 细节，互补不重复）。
-- **transfer 曾被误记为"父会话转手"**：实测是 export/import 序列化搬运（§7），parentID 仅为导入完整性校验。
+- **revert/move/transfer/diff 已拆至 [7.1_session-operations.md](7.1_session-operations.md)**（2026-10 拆分，零代码耦合实证）；4_session.md §7 的操作面总表仍覆盖全部四操作入口。
+- **transfer 曾被误记为"父会话转手"**：实测是 export/import 序列化搬运（[7.1](7.1_session-operations.md) §3），parentID 仅为导入完整性校验。
 - **手动压缩的事件归属曾分裂**：现规则是 manual 的 Started 由 runner 在投递时发（llm.ts:92-95），auto 的 Started 由 compaction 服务自己在 deliver 里发（compaction.ts:399-401），Failed 两边都可能发——onInterrupt 的 manual 分支不发（:672-675）是这套归属划分的关键细节。
 
 ## 相关篇
 
 - [4_session.md](4_session.md)：§7 触发面总表（本篇 §2 的入口行号出处）、§5 执行协调（drain/边界）、§6 读取路径（projector 投影事务）
 - [1_data-layer.md](1_data-layer.md)：durable/ephemeral 事件、Bus.reserveSequence、投影事务——理解 Ended 事件三重身份的基础
-- 规划中 5_inbox-coordination.md：控制项投递全语义（steer/queue、delivery boundary）——本篇 §2.1/§9.1 只引用
+- 规划中 5_inbox-coordination.md：控制项投递全语义（steer/queue、delivery boundary）——本篇 §2.1/§5.1 只引用
 - 未来 instructions 篇：InstructionState.advanceEpoch 与 epoch 三事件（Ended/Moved/Committed）

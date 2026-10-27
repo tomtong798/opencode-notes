@@ -7,6 +7,30 @@
 
 ---
 
+## 0.5 通俗完整描述（先读这段再看细节）
+
+模型想执行工具（跑 shell、改文件）之前，先过一道闸门问三个问题：**谁在请求（agent 的权限规则）、这个动作匹配哪条规则、匹配结果是放行/拒绝/问用户**。本篇讲的就是这道闸门的评估逻辑。
+
+规则长这样："shell 命令匹配 `git *` → 放行"、"edit 工具 → 问用户"、"匹配 `rm -rf *` → 拒绝"。评估的三个关键语义（都有反直觉处）：①**末位胜出而不是 deny 优先**——规则按顺序匹配、最后一条命中的说了算（优先级靠排序表达，agent 内嵌规则在前、会话规则在后、记住的决策最后）；②**deny 有一票否决特权**——评估前先扫一遍配置规则里有没有 deny 命中，有就直接拒（记住的"总是放行"翻不了盘）；③**没规则 = 问用户**——默认不是放行而是询问（白名单心智），这就是你看到的权限弹窗的来源。
+
+"问用户"之后的答案分三种：这次允许（once）/ 总是允许（always——记住这条决策，下次同类不再问）/ 拒绝。拒绝还会级联：同会话所有 pending 的询问一起拒（批量反馈）。注意"询问"是 ephemeral 事件不落库——崩溃后靠重新拉 pending 列表恢复，答案落回时才成为 durable 事实。
+
+规则的三级来源（评估时按此序拼接，末位胜出——permission.ts:158-163/:170-171 实测）：
+
+```
+[① agent 内嵌] → [② 会话规则] → [③ 记住的放行]   ← findLast 后者胜
+   设计者定的        程序为会话定的     用户自己定的
+```
+
+- **① agent 内嵌**：行为包出厂底线（explore 的只读就在这）；agent 没写 permissions 用 deny-all 兜底（安全缺省）。
+- **② 会话规则**：`session.permissions`——★**程序化写入**（HTTP `session.update` 端点或插件 `ctx.session.update`，发 durable 事件投影到会话上），给这个会话临时追加/覆盖。**没有"对话中说明"的入口**（聊天里说"允许我跑命令"不会变成规则）；前端 UI 的 auto-accept 开关走的是客户端本地偏好存储，也不落这条。
+- **③ 记住的决策**：用户点"总是允许"后落 permission_saved 表（按项目存 action+resource→allow），全部转 allow 规则垫最后——能压过 agent 限制，但压不过 deny（前置一票否决只扫配置级）。
+
+另一个易错点：**权限点不全是工具**。工具执行前是最大来源，但 FileAccess 层的 `read`/`external_directory`（file-access.ts:135/:154——读文件、访问目录外路径，@-提及/快照恢复都过这）和插件宿主的断言入口（host.ts:439）走同一评估器——权限守的是"能力动作"，工具只是动作的最大子集。
+
+一句话：**声明式规则表（末位胜出+deny 特权+默认询问）+ 询问协议（once/always/拒绝级联）+ 记住的决策——"能力边界"的完整闭环**。
+---
+
 ## 0. 模块地图
 
 ```
@@ -212,7 +236,7 @@ assert({action:"edit", resources:["/src/tmp/a.ts"]})
 ```
 
 - **agent 内嵌**（configured :158-163）：`agents.resolve(agentID ?? session.agent)` 取 agent 定义；`agent?.permissions ?? missingAgentPermissions`——**agent 未声明 permissions 时兜底 deny-all**（:19，安全缺省：新 agent 默认全锁）。agent 的 permissions 字段本身在配置装载时由 `config/plugin/agent.ts:84-92` 把顶层 `permissions`（config.ts:55-57）push 进**每一个** agent，`:122` 再叠加 per-agent 覆盖块的展开（`expandPermissions`，含 `~/` 路径展开）。字段来源细节归 [6_context.md](6_context.md)/8_agent，此处只记合并位点。
-- **session 级覆盖**：`session.permissions`（行投影，由 `session.permissions` durable 事件写入——session/session.ts:82-88 的 `setPermissions` → projector.ts:596 `set({permission: event.data.permissions})`）。拼接在 agent 之后（:162 `merge(agent规则, session.permissions ?? [])`）→ **会话规则覆盖 agent 规则**。
+- **session 级覆盖**：`session.permissions`（行投影，由 `session.permissions` durable 事件写入——session/session.ts:82-88 的 `setPermissions` → projector.ts:596 `set({permission: event.data.permissions})`）。拼接在 agent 之后（:162 `merge(agent规则, session.permissions ?? [])`）→ **会话规则覆盖 agent 规则**。写入方实测只有两个：HTTP `session.update` 端点（handlers/session.ts:278，payload 可选字段）与插件 `ctx.session.update`（plugin/host.ts:579）——**它是"程序化为会话定规则"的 API 面**（编排系统/自动化脚本/未来 UI 编辑器用），不是对话内容能写入的（模型聊天里说"允许我跑命令"不会变规则）；前端现有的 auto-accept 开关走客户端本地偏好（settings.permissions），也不落这条。
 - **saved 决策**：`savedRules()`（:148-156）把当前 project 的所有 saved 行映射为 `{action, resource, effect:"allow"}` 追加在最后——**saved 覆盖一切 ask**；但 deny 已在混入前短路，**saved 不能翻盘 deny**。
 
 另有一条 V1 兼容入口：`config/normalize.ts:180-183` 把旧 `permission`/`tool` 字段经 `migratePermissions`（:535+）与原生 `permissions` 合并为单一 Ruleset——纯配置装载期迁移，与运行时无关。

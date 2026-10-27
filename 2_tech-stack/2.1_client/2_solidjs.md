@@ -1,5 +1,7 @@
 # SolidJS
 
+> 家族导航：[2.0_reactivity.md](2.0_reactivity.md)（什么是响应式·概念前置）→ 本篇（概览）→ [2.1_solidjs-reactivity.md](2.1_solidjs-reactivity.md)（响应式机制实战）
+
 ## 是什么
 
 声明式响应式 UI 框架，React 的替代品。核心特征是**细粒度响应式（fine-grained reactivity）**：

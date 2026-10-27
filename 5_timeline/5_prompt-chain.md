@@ -50,7 +50,142 @@ SSE 收 → 10ms 批 → 本地总线.publish                                   
 
 ---
 
+## 0.5 服务端全生命周期：从进程启动到处理完成
+
+> §0 总图从"回车"开始；本节补上它的前奏与底层——**服务进程自己怎么活着**。四幕叙事，每步标注深入小节。这几轮校准的关键结论都嵌在这里：启动时 Map 为空、没有常驻消费者、执行权进程级而执行能力目录级、真相永远先落库。
+
+### 第一幕：进程启动（一次性的准备）
+
+```
+① OS 启动 opencode serve（或被桌面/TUI spawn）
+   └ server 装配全局服务图（进程级单例）：
+     Database → Bus（事件总线+投影注册）→ Job →
+     ★SessionExecution（内含 coordinator，★此刻 Map 为空）
+     ★恢复子系统 restart、SessionStore、LocationServiceMap（空表）
+
+② 数据库就绪：WAL 打开、迁移补齐
+   event / event_sequence / session / session_inbox / session_message
+   ——上次崩溃留下的 durable 事实全在这里
+
+③ HTTP 端口绑定，status.ready
+   ★此刻：没有任何 Location 图、没有任何执行 fiber、Map 空
+```
+
+### 第二幕：启动恢复（一次性扫描，跑完即止）
+
+```
+④ resumeSuspendedSessions（restart.ts:193）扫两处：
+   ├ session 表里带未释放 claim 的会话
+   │   （claim = 执行前写的"我正在跑"durable 标记；
+   │     正常完成/失败/用户中断会释放，崩溃/被杀才残留）
+   └ Job 表里 running 状态的后台任务（shell/subagent）
+
+⑤ 恢复顺序（:212-218）：先收 shell（补录结果）→ 再收 subagent
+   （releaseChildClaims）→ 最后逐个处理带 claim 的顶层会话：
+   ├ countResume 查预算（>10 次 → Failed 终结，放弃）
+   ├ 准入 synthetic"继续"消息（durable 先行）
+   └ execution.resume → wake ——进入第三幕通用流程
+   ★除此之外没有常驻消费者——扫描完，这个 fiber 也散了
+```
+
+### 第三幕：稳态运行（每个请求的通用流程）
+
+前半段秒回（细节 → §2）：
+
+```
+⑥ POST session.prompt（客户端已铸 id）
+   └ reconcile 幂等 → prepare →
+     bus.publish(inbox.enqueued)★同事务插 session_inbox 行
+     （输入已不可丢失）→ wake —— HTTP 秒回
+
+⑦ wake（run-coordinator.ts:136）：
+   ├ Map 有条目 → 只置 pendingWake（现有循环会再跑一轮）
+   └ 没有 → start：登记 + 发 Started + ★写 claim +
+     fork drain fiber ←★消费者此刻才诞生（每会话一个）
+```
+
+后半段排空（细节 → §3/§4/§5）：
+
+```
+⑧ drain：按 sessionID 查 store 得 location →
+   从 LocationServiceMap 借该目录的图
+   （首次访问 → 现场编译 53 服务，之后缓存）
+   └ 在借来的 runner 里循环：
+
+⑨ 循环体（llm.ts:74-199）：
+   ├ 门检查：无可提升 → Complete 跳出
+   ├ ★promote：steer 批止于控制项；空闲放行一个 queue；
+   │   删行+插消息同事务；提升成功 → 步数预算重置
+   ├ runStep：组装请求 → llm.stream → 逐事件发布+投影
+   │   ├ 工具：每 tool-call 一个专属 fiber 并行，结果先落盘再发布
+   │   ├ 模型还要工具 → 回填 → ★回到 ⑨ 再 runStep
+   │   │   （一次排空可含多次 LLM 调用）
+   │   └ 不再要工具 → Step.Ended（usage 落账）
+   └ 本轮结束：pendingWake 响过？→ 蹦床再跑一轮
+      否则 settled：发终态 + ★释放 claim（同事务）+
+      Map 移除条目 + fiber 自我终结（★消费者消亡）
+
+⑩ 与 ⑧⑨ 并行：每个事件经 Bus → SSE → client/solid 投影
+   → 组件重渲染（→ §6 回程七跳）
+```
+
+### 第四幕：异常路径（同一骨架的变奏）
+
+| 事故 | 发生什么 |
+|---|---|
+| 用户 Esc | interrupt 沿 fiber 树传播；工具记账段不可中断保完整；Interrupted + claim 释放（pending inbox 项不删） |
+| 会话迁移 | move 控制项消费 → drain 返回 Moved → ★借新目录 runner 带状态重入（执行权进程级不动，执行能力换目录） |
+| LLM 限流 | retry 分类退避（预算内），耗尽才 Failed |
+| ⑨ 中途 kill -9 | claim 残留（故意保留）→ 下次启动回到第二幕 ⑤ |
+| 目录长期不用 | 什么都不发生（图永不过期，仅显式 invalidate） |
+
+**一段话总结**：启动只建基座（Map 空、无消费者）→ 一次性恢复扫描（claim 残留者重新 wake）→ 稳态由 wake 点火：准入落库秒回、fork 该会话专属 fiber、借它所在目录的 runner、循环"提升 inbox → Step（LLM+工具并行）→ 事件投影"直到无活、门铃没响就释放 claim 并解散 fiber——**没有常驻调度者，一切按需诞生、用完即散；真相永远先落库，内存随便丢**。
+
+---
+
 ## 1. 浏览器侧：提交
+
+### 1.0 前置：composer 与 adapter
+
+**词义**：composer（作曲家/创作器）是 LLM 应用社区从邮件客户端借来的惯用词——**消息创作区**。应用界面里"读"的部分叫 timeline（对话时间线），"写"的部分就叫 composer：文本编辑、附件拖拽、@引用、agent/model 切换都在这块。`packages/app/src/composer/` 即此概念的代码统称。
+
+**`composer/adapter.ts`（120 行纯类型，零逻辑）**——composer 与两种会话环境之间的端口适配层，让 `submit()` 写一次服务两个场景：
+
+```
+ComposerAdapter = ActiveComposerAdapter ∪ NewSessionComposerAdapter
+                  （判别字段 kind）
+│
+├─ 公共底座（:96-102）
+│    state ——输入框状态（草稿文本/附件，可捕获快照）
+│    ready / working / controls / submitted
+│
+├─ ActiveComposerAdapter（:104-109，活跃会话页）
+│    kind: "active-session"
+│    session() ——ComposerSession（:52-94）能力包：
+│      api（command/shell/switchAgent/switchModel/revert）
+│      data（session.prompt 乐观准入、setStatus）
+│      handoff / current / admitted
+│    interrupt() ——中断当前 turn
+│
+└─ NewSessionComposerAdapter（:111-118，新会话草稿页）
+     kind: "new-session"
+     start() ——首次提交的"建会话"入口：
+       传入选择+提交状态+用户消息，
+       返回 {session, cleanupReady, complete?}
+       ——成功后才切换成 active 形态
+```
+
+两个实现与一个消费者：
+
+| 角色 | 位置 | 职责 |
+|---|---|---|
+| 实现 A | `session/composer/adapter.ts` `createActiveComposerAdapter` | 从已存在 sessionID 组装（working = `data.session.status(id)==="running"`） |
+| 实现 B | `new-session/composer-adapter.ts` `createNewSessionComposerAdapter` | draft 页组装（含 worktree/branch/MCP 控件），`start()` 里建会话 |
+| 消费者 | `composer/submit.ts` | :73 典型判别消费：`adapter.kind === "active-session"` 才走 steer 追踪分支 |
+
+`submit.test.ts:55/69` 的 `active()`/`fresh()` 两个构造器靠此端口注入假环境——adapter 同时是天然的测试边界。
+
+### 1.1 `createComposerSubmit` 的提交流
 
 **`packages/app/src/composer/submit.ts`** —— `createComposerSubmit`（L56，返回 `{submit, stop}`）的提交流：
 
@@ -87,6 +222,36 @@ sendPrompt
 │              prepare: () => commit()）
 │
 └─ L545      session.data.session.prompt(admission) → data 层
+              （.catch 重试一次——幂等靠铸 id + 服务端 reconcile）
+```
+
+**"app 怎么调到 client"——不是运行时转发，是四步依赖注入**。`session.data.session.prompt` 这个方法本来就长在 client/solid 的 Data 对象上；app 启动时把 HTTP 客户端注入给它，再经引用传递到 submit.ts 手里：
+
+```
+① 每服务器一次的装配            app/runtime/server/runtime.tsx
+│
+├─ L172  sdk = createServerSdkContext(conn, scope)
+│        （内部 OpenCode.make({baseUrl, headers: Basic})）
+│
+└─ L174-185 createData({           ←client/solid 工厂
+      api: () => sdk.api,          ★promise 客户端注入数据层
+      event / connection })
+      产出 Data 对象（含本节的 session.prompt 方法）
+
+② Solid Context 下发             app/runtime/server/current.tsx
+│
+└─ <context.provider ctx={{data}}>
+   useData() = useServer().ctx.data（:50-53）——组件树内随处可取
+
+③ adapter 装配（每会话）          app/session/composer/adapter.ts
+│
+└─ L21  data = useData() → :38 塞进 ComposerSession.data
+
+④ 提交终点                       app/composer/submit.ts
+│
+└─ L545  session.data.session.prompt(admission)
+         真正发 HTTP 的在其内部的
+         api().session.prompt(...)（data.ts:1646）
 ```
 
 **`packages/client/src/solid/data.ts:1611-1655` `session.prompt`** —— 乐观准入流：
@@ -138,6 +303,38 @@ Session.prompt(sessionID, input)
 **`SessionInbox.admit`（`session/inbox.ts:169-202`）**：L174 再对账 → L176-198 `bus.publish(SessionEvent.InboxEnqueued)` → 投影 `projectAdmitted`（L277-317）：`session_inbox` 插行（`onConflictDoNothing`），**与事件发布同事务**。
 
 ## 3. 唤醒与 drain
+
+### 3.0 是什么、为什么（三问校准）
+
+**wake（唤醒）= 按门铃**——告诉协调器"这个会话有新活儿了"；**drain（排空）= 把活干完**——把该会话积压的待办（inbox 输入、待续 Step）一轮处理到没有可做的为止。准入与执行分离后需要一座从"事实落库"到"开始消费"的桥，wake 就是其最小（advisory）形态。
+
+**为什么是这个形状**——五个不可选约束的联立解：
+
+```
+要崩溃安全   → 准入/执行分离（durable 事实 vs 消费）── spec:11
+要 HTTP 秒回 → wake 仅建议性触发，不等结果（advisory）
+要会话内顺序 → 同 key 串行；多 wake 折叠成"再跑一轮"── spec:60
+要堵竞态缝   → pendingWake 门铃：drain 的"最后一次检查"与
+               "宣布空闲"非原子（run-coordinator.ts:31-37
+               注释原话 "closes the gap …cannot be one
+               atomic step"），门铃补上这个窗口
+要 steer 批  → drain 排空到自然空闲，期间到的 steer 收进
+               下一批；蹦床循环（L81）不涨栈
+```
+
+**与生产者/消费者模式的辨析**（骨架像，三处不同）：
+
+| 维度 | 经典 MQ | 这里 |
+|---|---|---|
+| 取的规则 | 消费者全取/逐条 | **投递词汇**：steer 批到首个控制项边界；queue 空闲时**恰好一个**再重评估（spec 原话 "exactly one queued item delivers"） |
+| 消费单位 | 一条消息一次处理 | 一次提升触发 **Step 链**（内层 LLM 步进循环，工具结果回填续跑，不碰 inbox） |
+| 消费者生命周期 | worker 常驻 | **drain 完即散，wake 再点火**（executions Map 是易失的） |
+
+**并发粒度（三层）**：session 间并行（一 session 一条 `executions Map` 条目 = 一个 drain fiber + 各自门铃，spec:61 "Different Sessions run concurrently"）；session 内串行（drain→Step 链按序）；Step 内工具并行（forkScoped）+ 发布串行。
+
+**inbox 在哪**：**持久化**——`session_inbox` 表（sql.ts:125-143），入队/消费与事件同事务。内存中的 pending 镜像、fiber 注册表全是易失派生（崩溃后靠表行 + claim 恢复续跑）；若 inbox 在内存，"秒回后 kill -9 消息蒸发"将是最恶劣的失败形态——持久化是第一性决策（详见 [../6_modules/1_data-layer.md](../6_modules/1_data-layer.md) §9.5 分界表）。
+
+### 3.1 门铃模式的运行流
 
 **`SessionExecution.wake`（`session/execution.ts:150-174`）** → 委托协调器。
 
@@ -256,15 +453,41 @@ SessionStep.attempt(input)
 
 ## 6. 回程：事件到像素
 
-| 跳 | 位置 | 机制 |
-|---|---|---|
-| 1 | `core/src/bus.ts` | publish = durable 追加 + 投影事务 + 订阅分发 |
-| 2 | `server/src/event-feed.ts:33-81` | Bus.listen → SSE 帧（`data: {json}\n\n`，L30）→ 订阅者队列 |
-| 3 | `handlers/event.ts:8-36` | SSE 端点：connected 先发 + 15s 心跳合并 |
-| 4 | `client/solid/connection.ts:76-145` | 迭代读取 → `touch()` → `publish()` 10ms 批 |
-| 5 | `app/runtime/server/client.tsx:89-105` | `events.publish` → createGlobalEmitter |
-| 6 | `client/solid/data.ts:2007-2011` | `event.listen → handleEvent` → `setStore(produce)` |
-| 7 | Solid 细粒度响应 | 读 `store.session.message[id]` 的组件自动重渲（`text.delta`：`editText(t => t.text += delta)`，L952） |
+一次 `text.delta` 从 Bus 到屏幕的七跳管道（跨服务进程 → renderer 进程边界）：
+
+```
+【服务进程】
+│
+├─ ① core/src/bus.ts
+│    publish = durable 追加 + 投影事务 + 订阅分发
+│
+├─ ② server/src/event-feed.ts:33-81
+│    Bus.listen → SSE 帧（data: {json}\n\n，L30）
+│    → 订阅者队列
+│
+├─ ③ handlers/event.ts:8-36
+│    SSE 端点：connected 先发 + 15s 心跳合并
+│
+│    ════════ HTTP/SSE（跨进程）════════
+│
+【renderer 进程】
+│
+├─ ④ client/solid/connection.ts:76-145
+│    迭代读取 → touch()（喂 watchdog）
+│    → publish() 10ms 批量 flush
+│
+├─ ⑤ app/runtime/server/client.tsx:89-105
+│    events.publish → createGlobalEmitter（本地总线）
+│
+├─ ⑥ client/solid/data.ts:2007-2011
+│    event.listen → handleEvent
+│    → setStore(produce(...))
+│
+└─ ⑦ Solid 细粒度响应
+     读 store.session.message[id] 的组件自动重渲染
+     （text.delta：editText(t => t.text += delta)，L952）
+     ——组件只跑一次，信号级精确更新 → 像素
+```
 
 ## 7. 关键不变量（对照 specs/v2）
 

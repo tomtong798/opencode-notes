@@ -1,10 +1,22 @@
-# 认证子系统详解（Integration/Credential 存储 → OAuth 尝试机 → provider 凭证解析 → Copilot/Console 专层）
+# 凭证体系详解（Credential 存储 → OAuth 尝试机 → provider 凭证解析 → Copilot/Console 专层）
 
 > 一句话：**v2 的认证是一个通用的 "integration（认证方法注册表）+ credential（SQLite 凭证库）+ connection（激活选择）" 三件套——每个 provider 插件向 Integration 注册认证方法（OAuth device/authorization-code、API key、command、env），凭证以 JSON 值落库、per-integration 单激活，模型解析时 `connection.resolve()` 惰性取凭证（OAuth 临期自动刷新），另有独立于 LLM 体系的 server 访问密码（HMAC 会话）。**
 > 代码基线：v2.0.30，dev 分支（e25b7abf89）；行号实测（2026-10-19）。
 > 权威出处：`packages/schema/src/credential.ts` / `integration.ts`、`packages/core/src/credential.ts` / `integration.ts`
-> [返回 README](README.md) | 前置 [3_model-protocol.md](3_model-protocol.md) §3（provider 凭证解析接缝：`fromCatalogModel(model, credential)`）、[1_data-layer.md](1_data-layer.md)（数据库层）
+> 拆分说明：本篇原含"服务访问凭证"一节——2026-10 拆出（server/auth.ts 与本篇体系零 import 实证），见 [18.1_server-access.md](18.1_server-access.md)。本篇聚焦 LLM 侧两把钥匙：秘密怎么来（尝试机）→ 存哪（credential 表）→ 怎么选（优先级）→ Copilot/Console 两大消费者案例。
+> [返回 README](README.md) | 前置 [3_model-protocol.md](3_model-protocol.md) §3（provider 凭证解析接缝：`fromCatalogModel(model, credential)`）、[1_data-layer.md](1_data-layer.md)（数据库层）| 姊妹篇 [18.1_server-access.md](18.1_server-access.md)（服务访问：零耦合的第三把钥匙）
 
+---
+
+## 0.5 通俗完整描述（先读这段再看细节）
+
+"认证"在这个系统里其实是**三层不同的事**，本篇拆开讲：
+
+**第一层：provider 凭证**（最常用）——各家 LLM 的 API key。存储优先级：数据库里的凭证（最近激活的在前）> 环境变量 > 无。注意是**明文落 SQLite**（没有 keychain 加密——本地优先的信任模型），文件权限 0600 兜底。**第二层：OAuth 流程**——opencode 账户/Copilot/ChatGPT 这类"登录获取 token"：三种流程并存（设备码轮询、本机回调页 PKCE、手输授权码），统一的状态机管并发/超时/刷新。Copilot 有专层因为它的 token 不过期、要查订阅额度、请求头还要改造。**第三层：服务访问凭证**（已拆至 [18.1](18.1_server-access.md)）——连本机 server 的那把密码，与本篇前两层零代码耦合。
+
+容易误会的两点：①**没有独立的 auth 模块**——认证逻辑散在 integration（尝试机）/credential（存储）/各 provider 插件三处，"加一种登录方式=写一个 provider 插件"；②**packages/identity 不是身份认证**——它只是 logo 图片资产（常见误认）。
+
+一句话：**provider key 的存取优先级、三种 OAuth 流程的状态机、服务访问的密码注入——三层各自独立又都服务于"把钥匙管好"**。
 ---
 
 ## 0. 模块地图
@@ -252,12 +264,9 @@ Copilot 需要专层的原因，实测是三层叠加：
 
 实测 `packages/identity/` **只有 6 个品牌 logo 文件**（mark.svg / mark-light.svg / mark-96/192/512×2.png；`ls` 确认无 package.json、无 src/），全仓库 grep `@opencode/identity` 零引用。它既不是设备身份也不是遥测匿名 ID——就是 opencode 品牌 mark 的资产存放目录。**本篇将其划出认证边界**；若其他卷引用 "identity 包"，应指此资产目录。core 里最接近"设备身份"的是 `chatgpt-agent-host-id`（chatgpt.ts:102-105：`urn:uuid:{randomUUID}` 持久化在 plugin storage），但那是 ChatGPT 动态客户端注册的 host 标识，非通用身份层。
 
-## 7. 服务访问凭证
+## 7. 服务访问凭证（已拆至 18.1）
 
-桌面/CLI 连 server 的 password 在 **server + cli 两层，与 LLM 凭证体系完全无关**：
-
-- **server 侧**（server/src/auth.ts，66 行）：HTTP basic auth，username 固定 `opencode`（:25）；`authorized` 接受 password 本体**或**配对会话 token（:36-38）。会话是 HMAC 双层签名：`sign() = HMAC(HMAC(password, "opencode-session-v1"), expires)`，30 天 TTL（:27、:64-67）；"Sessions are signed with a key derived from the server password, so rotating the password revokes every session"（:41 注释）；比较用 `timingSafeEqual`（:61）；cookie 名带端口——"Browsers share cookies across ports on the same host"（:49-53）。
-- **CLI 侧**（cli/src/services/）：standalone 模式 `randomBytes(32).toString("base64url")` 生成密码（standalone.ts:37），经 `OPENCODE_PASSWORD` env 传给 server 子进程（:17-24），客户端以 basic auth 回连（:53）。服务注册/配置落 `service.json`（`mode: 0o600`，service-config.ts:97-100；端口按 channel 派生，0xC0DE 致敬 v1，:65-77）。`dev:live` 用的 `opencode service get password` 即读此文件（handlers/service/get.ts:8-13）；显式 `--server` 时密码来自 `Env.password`（server-connection.ts:24-25、env.ts:7-10）。
+本节已拆至 [18.1_server-access.md](18.1_server-access.md)——与 LLM 凭证体系零代码耦合（server/auth.ts 对 credential/integration 零 import），2026-10 拆分归位。
 
 ## 8. 不变量与设计取舍
 

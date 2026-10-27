@@ -7,6 +7,17 @@
 
 ---
 
+## 0.5 通俗完整描述（先读这段再看细节）
+
+**Location = 目录作用域**：opencode 同时服务多个项目目录（你开着的每个仓库），每个目录需要自己的一套服务（它自己的配置、agent、技能、MCP 服务器……）——Location 就是"哪个目录"这个身份，五实体关系口诀：**Location 是键、Instance 是值、Project/Worktree/Workspace 是三本账**。
+
+核心机制是**惰性编译+缓存**：服务启动时不为任何目录建东西；第一个带着某目录的请求到达，才现场编译该目录的完整服务图（读它的配置、发现它的 agent/skill、连它的 MCP——53 个服务），编好放进缓存**永不因空闲过期**（只有显式失效：git 状态结构性变化、空闲回收、运维接口）。这就是"服务秒起、打开项目第一下稍慢、之后一直快"的原因。
+
+三个容易偏差的点：①**缓存不刷新只重建**——配置文件改了不是"热更新缓存里的图"，而是图内部的服务自己监听变更（Config 服务在图内自己有 watcher）；图的失效只用于"目录身份本身变了"。②**全局服务跨目录共享**——数据库、凭据这些（global 作用域节点）全进程一份，编译多个目录图时共享子图不重建。③**Worktree 是 git 工作树账本**（新会话可选在工作树里开——改动隔离），Workspace 是保留位（显式身份目前未启用）。
+
+一句话：**目录=服务图的缓存键：按需编译、永久缓存、全局共享、显式失效——"多项目并行的隔离单元"**。
+---
+
 ## 0. 模块地图
 
 ```
@@ -187,6 +198,46 @@ LocationWatcher.node,
 instance.ts:119-133 的 `Options`：`plugins`（出生自带插件）、`discovery`（默认 true；false = vanilla 启动：不向上扫配置、不读全局配置目录、不加载 plugin-dir——但显式指名的东西照常生效）、`replacements`。vanillaReplacements（:142-145）只换两个节点：`Config.configured({project:false, global:false})` 与 `InstructionDiscovery.configured(...)`。替换链顺序（:150-157）：**vanilla 默认 < 调用者替换 < 实例绑定**（Location.boundNode / InstancePlugins.bound 最后写、最强）。
 
 ## 4. LayerMap 缓存语义
+
+### 4.0 组装宿主：buildLocationServiceMap 管的五件事
+
+`buildLocationServiceMap`（location-services.ts:12）不只是"建一个缓存"——它是**图的运营者**：`Instance.layer`（编译器）负责造图，宿主负责图的生老病死。没有它，每次请求都要重新编译 53 节点；有了它，才有"首请求编译、之后复用"的惰性闭环：
+
+```
+buildLocationServiceMap
+│
+├─ ① 缓存与借还（核心）                  :21-22
+│    LayerMap.make((ref) => …)
+│    └─ ref → Services 按需缓存：
+│       首次 get(ref) 触发 builder，
+│       之后 get 命中直接借出
+│
+├─ ② 构建失败的自愈                      :47-49
+│    onExit：失败 build 摘除 + invalidate
+│    → 环境修复后下次请求重试
+│
+├─ ③ 失效的清理顺序                      :63-77
+│    先摘路由 → inner.invalidate → build.close
+│    （uninterruptible；进行中的步骤持有借图
+│     到安全边界才交还）
+│
+├─ ④ 进程退出的善后                      :18
+│    owner scope 挂全部图的 finalizer，
+│    服务关闭时依次 lifecycle.shutdown
+│
+└─ ⑤ 自引用解环（最妙的一手）            :79-88
+     Instance.node.replace(Layer.succeed(Instance.Service,
+       { provide: (session) => Effect.provide(map.get(session.location)) }))
+     └─ 宿主把 map 自己注入每张编译出的图：
+        图内代码要"某会话所在目录的上下文"时，
+        Instance.Service.provide 实际是★回查宿主
+        借出那个目录的图——先有鸡还是先有蛋的环，
+        由"产物运行时反找宿主借邻居"解开
+```
+
+五件事各堵一个洞：① 重复构建（同目录每次请求重编译不可接受）② 失败目录永久坏死 ③ 清理顺序错误会撕断在跑会话 ④ 退出泄漏（插件进程/watcher fd 没人关）⑤ "目录服务"自己也要进图但它又管理所有图的自指矛盾。
+
+位置口诀：**Instance.layer 是造车的工厂，组装宿主是车队管理公司**——车（图）谁造它不管，但哪辆在路上（借出）、哪辆报废（失效）、下班怎么收车（shutdown），全归它。
 
 ### 4.1 infinity 的取舍
 

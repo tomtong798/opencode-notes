@@ -7,6 +7,56 @@
 
 ---
 
+## ⚠️ 先辨析：本篇的"上下文"不是你以为的那种
+
+中文"上下文"一词多义，这个系统里至少有三个角色共用它，**代码上是三条独立通路**：
+
+| 界面/概念上的"上下文" | 实际调用 | 数据来源 | 归属 |
+|---|---|---|---|
+| **UI 的会话详情/历史快照**（session 页那个按钮） | `session.context` 端点（handlers/session.ts:512）→ `SessionHistory.load` | durable 消息的折叠视图 | [4_session.md](4_session.md) §6 读取路径 |
+| **token 用量**（同屏显示的 usage） | `session.usage.updated` 事件流 | step.ended 的 usage 投影 | 统计面（4_session §6/§7） |
+| **LLM 请求组装**（无 UI，纯内部） | 每次 Step 内部组装 | 指令三表 + system 模板 + 消息重放 | ★**本篇** |
+
+三者共享"模型看到的窗口"这个直觉，但**本篇只讲第三条**：消息被组装进下一次 LLM 请求时，加上什么 system prompt / 指令基线与增量 / 缓存策略——它没有任何界面。想了解"会话记录了什么"（id/messages/token）请去 [4_session.md](4_session.md)；本篇回答的是"**这一次调用要带什么、怎么带最省**"。这个"带什么/怎么带"正是社区所说的**上下文工程**（Context Engineering）的对象——opencode 全部上下文治理的统一视角见 [19_context-engineering.md](19_context-engineering.md)（本篇是其"指令编排"支柱的深挖）。
+
+### 为什么叫"指令"（Instructions）而不是"上下文的组装"
+
+**Instructions 是 opencode 源码自己的命名**（`packages/core/src/instructions/`、`Instructions.Key.make("core/date")`、durable 事件 `InstructionsUpdated`、三张 instruction 表）——笔记忠实转译。这个词精确划出了窗口内容里**与 messages 相对的一个类别**：
+
+```
+LLM 请求
+├─ system prompt（harness 模板 + 工具指导）
+├─ ★instructions——"指令"：环境性、持续性、非对话性的背景设定
+│   ├ core/date：今天几号（模型自己不知道）
+│   ├ core/environment：环境变量快照
+│   ├ core/instructions：AGENTS.md 们（工程规范）
+│   ├ core/skill-guidance：有哪些技能可用
+│   └ core/codemode：代码执行环境说明
+│   共性：都是"给模型的持久性设定"，不是"对话里说过的话"
+└─ messages：对话流（用户问的/模型答的/工具结果）
+```
+
+**指令是环境（ambient），消息是事件（evential）**——AGENTS.md 不因为某轮对话而存在，它在每次调用的背景里生效；它变更时也不是"说了句新话"而是"环境变了"（所以走 InstructionsUpdated 的 chronological 注入，让模型看到"设定更新了"）。这与 CLAUDE.md/AGENTS.md 社区通称 "instructions files" 对齐。
+
+不叫"上下文的组装"的三个理由：① 组装是动作（select/load 流程），指令是被组装的一类**原料**——本篇的代数（Source/make/combine）正是围绕这类原料建的，命名点的是原料分类；② `Context` 在 Effect 生态已被 DI 的 Context.Service 占用，`session.context` 端点又已表示"历史快照"，再叫 Context 三方撞名；③ 指令只是窗口的一个支柱（system+instructions+messages+tools），叫"上下文"会错误暗示它管全部——正是上面那张三种上下文表要防的混淆。
+
+## 0.5 通俗完整描述（先读这段再看细节）
+
+模型每次被调用，看到的窗口由三段拼成：**system prompt（你是谁/怎么干活）+ 指令（环境背景：今天几号、工程规范、有哪些技能）+ 消息（对话本身）**。本篇讲的就是中间那段"指令"的工程——**模型该知道的背景设定，怎么组装、怎么缓存、怎么在变更时让模型知道**。
+
+设想最朴素的做法：每次调模型，把 AGENTS.md、日期、环境变量全部读一遍、整段塞进 system prompt。这能跑，但三个问题：①**浪费**——这些背景几乎不变，每次全量重发，前缀缓存永远命中不了（贵且慢）；②**感知不到变化**——AGENTS.md 中途改了，模型看到的是新旧混杂的静态快照；③**窗口膨胀**——背景越积越多，挤占对话空间。
+
+opencode 的方案分三招：**分层缓存**——不变的背景编成"基线"（epoch 快照）放 system 第二段，稳定部分的前缀可缓存；**增量通知**——某项背景变了（比如 AGENTS.md 更新），只在对话流里插一条"设定已变更：……"的轻量提醒（delta 事件按时间序注入），模型像看到"系统公告"一样知道环境变了，不用重发全文；**压缩重建**——窗口满触发压缩时，指令基线在新 epoch 重新快照（旧公告已被折叠进摘要）。
+
+两个容易理解偏差的关键点：
+
+1. **指令是"环境"，消息是"事件"**——AGENTS.md 的存在不依赖任何一轮对话（环境性背景设定）；它变了不是"说了句新话"而是"环境变了"。本篇管的只是这类内容；对话记录（id/messages/token）是另一回事（篇首三种上下文表的第三列）。
+2. **指令也是 durable 事实**——每项指令的值经哈希去重后存三张 SQLite 表（不是每次现读文件）：重启后指令状态原样恢复；值与渲染文本分离（哈希只算值），delta 冻结进事件——重放历史时模型看到的公告文本与当时一致。
+
+一句话：**把"模型该知道的背景"当成有身份、有版本、可缓存、可增量通知的持久数据来管——基线+增量两招让背景既新鲜又几乎不花窗口和钱**。
+
+---
+
 ## 0. 模块地图
 
 两个 instructions 位置并存，职责不同（均已实测确认，`ls` 实查）：
@@ -143,6 +193,62 @@ ${OPENCODE_TOOL_GUIDANCE}
 ```
 
 agent 优先级（model-request.ts:111-113）：`agent.system` 非空则**完全替换**默认模板（不是拼接）；插件侧 optimize.ts:84 复用 `render` 做工具变更时的增量指导。最终 system 数组 = `[agent 定义或默认模板, initial 指令基线]`，空段过滤后各包成 `SystemPart.make`（:116-117）。
+
+## 2.5 指令全生命周期总图（发现 → 组合 → 观测 → 落库 → 进窗口）
+
+一张图贯穿 §3-§5（各段细节见对应小节）：
+
+```
+【发现层】七类源各自生产内容（§3）
+│
+├─ 扫描插件 config/plugin/instruction.ts（第一跳）
+│   ├ 候选集 = 全局 ~/.config/opencode/AGENTS.md
+│   │         + start→stop 每级祖先的 AGENTS.md（近者先）
+│   │         + config instructions:（glob/绝对路径/URL）
+│   ├ watcher+100ms 防抖重扫；config.updated 触发 refresh
+│   └ 写入状态容器 instruction-discovery.ts（第二跳）
+│       └ 闭包成单一 Source：key="core/instructions"
+│         read=文件内容清单；变了→changed 渲染 unified diff
+│
+├─ 内建源 builtins.ts
+│   ├ core/date（今天几号）      └ core/environment（env 快照）
+├─ skill-guidance（技能清单）    ├ codemode（执行环境说明）
+├─ MCP 指令 / references / api/<key>（instruction_entry 的 KV）
+│
+├─【组合层】SessionContext.select（context.ts:150-158）★只在此刻合流
+│   按共享度排序合并七类：codemode→MCP→references→skills
+│   →discovery→builtins→entries（注释："最共享在前"——
+│   排序稳定利于前缀缓存）
+│   同步收窄：Permission.merge(agent,session) 过滤
+│   discovery 与 tools（explore 看不到的文件不进它的源）
+│
+▼ 每次 Step 前（llm.ts:202-207 prepareContext）——★不是启动时！
+│
+├─【观测层】InstructionState.observe（state.ts:21-36）
+│   并发 read 全部源 → canonical JSON → sha256（值哈希，
+│   不含渲染文本）→ 与 current_values 逐 key 对比
+│   ├ 全部未变 → commit 跳过（:44）★零成本快路径
+│   └ 有变更/首次 → diff 出 Admission{delta, blobs}
+│
+├─【落库层】commit → publish InstructionsUpdated（durable 事件）
+│   ├ 渲染文本冻结进事件（重放历史时模型看到的公告
+│   │ 与当时一致）
+│   ├ 投影（同事务）：消息行 + state.apply
+│   │   （current_values ← 哈希增量；through_seq 推进）
+│   └ blob 按内容寻址入 instruction_blob 表
+│
+└─【进窗口层】context.load → history.entriesForRunner
+    ├ 首次：state.initial 解引用 initial_values 全部 blob
+    │   → renderInitial → system[1] ★基线（epoch 快照）
+    ├─ 后续变更：InstructionsUpdated 已作为消息
+    │   在对话流里（模型"看到系统公告"）——不再重发全文
+    └─ 压缩后：Compaction.Ended 投影 → advanceEpoch
+        （旧公告折叠进摘要；基线在新 epoch 重新快照）
+```
+
+三个贯穿性事实：①**源是懒读的**——不是启动时快照，每次 Step 前 observe 现读（变了才落库）；②**窗口里永远只有"基线+增量公告"两形态**——全文只在首次/压缩后出现；③**哈希算值不算文**——渲染器升级不会误报"指令变了"。
+
+---
 
 ## 3. 指令发现链
 
@@ -405,4 +511,4 @@ return Service.of({
 - [9_tool.md](9_tool.md)——Tool.Snapshot 如何进 select 与 system 模板工具指导
 - [../5_timeline/5_prompt-chain.md](../5_timeline/5_prompt-chain.md)——baseTranscript 之后的请求/流式/工具执行时序
 - 8_agent（未写，占位）——agent.system 覆盖默认模板的规则、agent permissions 如何收窄 discovery 与 tools（context.ts:130-131）
-- 7_compaction（未写，占位）——overflow 触发、native checkpoint 窗口、providerContext 存储细节
+- [7_compaction.md](7_compaction.md)——overflow 触发、native checkpoint 窗口、providerContext 存储细节

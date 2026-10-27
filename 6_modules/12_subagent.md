@@ -3,8 +3,19 @@
 > 一句话：**subagent = 主会话里一次工具调用所派生的"子 Session"——父经 `subagent` 工具创建/续接子会话（parentID 指向父）、注入 prompt、注册为 Job；前台模式 `jobs.block` 阻塞等待子会话 drain 完成并把最后一条 assistant 文本作为 Tool.Success 回流，后台模式立即返回、完成后以 synthetic 消息通知父会话；重启后由 restart.ts 的 recoverSubagent 收养孤儿子会话。**
 > 代码基线：v2.0.30，dev 分支；行号实测（2026-10-19）。
 > 权威出处：`packages/core/src/tool/plugin/subagent.ts`、`session/subagent-job.ts`、`session/subagent-completion.ts`、`session/execution/restart.ts`；规范 `specs/v2/session.md`（执行声明）。
-> [返回 README](README.md) | 前置 [4_session.md](4_session.md)（聚合/inbox/drain）、[9_tool.md](9_tool.md) §4.9（工具输入 schema 与权限点） | 关联 [../5_timeline/6_tui-cli-prompt-chain.md](../5_timeline/6_tui-cli-prompt-chain.md)（前端事件归属）、16_pty-job.md（Job 注册表，留位）
+> [返回 README](README.md) | 前置 [4_session.md](4_session.md)（聚合/inbox/drain）、[9_tool.md](9_tool.md) §4.9（工具输入 schema 与权限点） | 关联 [../5_timeline/6_tui-cli-prompt-chain.md](../5_timeline/6_tui-cli-prompt-chain.md)（前端事件归属）、[17_job.md](17_job.md)（Job 注册表本体）
 
+---
+
+## 0.5 通俗完整描述（先读这段再看细节）
+
+主会话里模型调用 subagent 工具时，会**派生一个子会话**（parentID 指回父）：子会话有自己的 inbox、自己的执行循环、完整的 LLM 对话——比如"用 explore 只读探查一下这个库的结构"，探查在子会话里独立进行，**完成后最终结论回流父会话**（作为工具结果），中间过程不占父窗口。这就是上下文工程里"subagent 隔离"杠杆的落地。
+
+它是三个既有机制的薄组合（433 行编排层）：**子会话**（Session 派生，parentID 数据库列）+ **Job 注册表**（后台任务身份，Job ID=子会话 ID）+ **双回流通道**（前台：父的工具调用等它完成拿结果；后台：完成时以"通知消息"形式注入父会话，失败也保留会话 ID 可续问）。
+
+几个关键语义：**深度守卫**默认 1（子不能再派孙——防指数爆炸，可配置）；**权限继承**——子继承父 agent 的 deny 规则（曾出过 Plan Mode 越权事故后补的）；**中断传播**——父被中断会传递给子；**崩溃恢复**——重启后孤儿子会话被恢复子系统认领续跑（有预算上限）；前端归属——TUI/CLI 沿 parentID 链判定"这个子会话的事件归我管"。
+
+一句话：**子会话=独立的上下文容器；派生轻（三个机制组合）、隔离强（过程不进父窗口）、回收全（结果回流+恢复认领）——"分身干活，正身省心"**。
 ---
 
 ## 0. 模块地图
@@ -375,4 +386,4 @@ CLI run 在共享 server 上订阅全量事件流，用**沿 parentID 链递归�
 - 前置：[9_tool.md](9_tool.md) §4.9（subagent 工具输入 schema、权限点、与 13 个 direct 工具的对照）
 - 关联：[11_permission.md](11_permission.md)（permission.assert 与 agent 级 ruleset）
 - 关联：[../5_timeline/6_tui-cli-prompt-chain.md](../5_timeline/6_tui-cli-prompt-chain.md)（TUI/CLI 事件消费全景；本篇 §8 只取切片）
-- 留位：16_pty-job.md（Job.Service 注册表本体——block/background/wait/pendingBackground 的完整语义，本篇 §3 只写 subagent 视角）
+- Job 注册表本体（block/background/wait/pendingBackground 完整语义）：[17_job.md](17_job.md)
